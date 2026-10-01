@@ -1,0 +1,626 @@
+'use strict';
+/* ============ helpers ============ */
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = n => '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+const fmtDate = d => d ? new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+const fmtDT = ts => { const x = new Date(ts); return x.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) + ' ' + x.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }); };
+function toast(msg, type) { const t = $('#toast'); t.className = 'toast show ' + (type || ''); t.textContent = msg; clearTimeout(t._t); t._t = setTimeout(() => t.className = 'toast', 2600); }
+
+const ROLES = { admin: 'Administrator', site: 'Site Person', checker: 'Checker', purchase: 'Purchase Reviewer', operations: 'Operations Reviewer', accounts: 'Accounts Reviewer' };
+const PILL = { Draft: 'p-draft', Submitted: 'p-sub', Checked: 'p-chk', 'Purchase Reviewed': 'p-pur', 'Operations Reviewed': 'p-ops', 'Accounts Reviewed': 'p-acc', Approved: 'p-app', Query: 'p-qry', Rejected: 'p-rej' };
+const pill = s => `<span class="pill ${PILL[s] || 'p-draft'}">${esc(s)}</span>`;
+
+const S = { user: null, projects: [], allProjects: [], categories: [], locations: [], users: [], page: 'dashboard' };
+const userName = id => (S.users.find(u => u.id === id) || {}).name || '—';
+
+/* ============ api ============ */
+async function api(method, path, body, isForm) {
+  const opt = { method, credentials: 'same-origin', headers: {} };
+  if (isForm) opt.body = body;
+  else if (body != null) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch('/api' + path, opt);
+  if (r.status === 401) { showLogin(); throw new Error('Session expired'); }
+  const ct = r.headers.get('content-type') || '';
+  const data = ct.includes('json') ? await r.json() : await r.text();
+  if (!r.ok) { const err = new Error((data && data.error) || ('HTTP ' + r.status)); err.data = data; err.status = r.status; throw err; }
+  return data;
+}
+
+/* ============ auth / boot ============ */
+function showLogin() { $('#login').classList.remove('hide'); $('#app').classList.add('hide'); }
+async function doLogin() {
+  $('#lg-err').textContent = '';
+  try { await api('POST', '/login', { username: $('#lg-user').value.trim(), password: $('#lg-pass').value }); await boot(); }
+  catch (e) { $('#lg-err').textContent = e.message; }
+}
+async function logout() { try { await api('POST', '/logout'); } catch (e) {} location.reload(); }
+
+// re-pull active categories/locations/projects after masters change so forms stay current
+async function refreshLookups() {
+  try {
+    const d = await api('GET', '/bootstrap');
+    S.categories = d.categories; S.locations = d.locations; S.projects = d.projects; S.allProjects = d.allProjects;
+  } catch (e) {}
+}
+
+async function boot() {
+  const d = await api('GET', '/bootstrap');
+  Object.assign(S, { user: d.user, projects: d.projects, allProjects: d.allProjects, categories: d.categories, locations: d.locations, users: d.users });
+  $('#login').classList.add('hide'); $('#app').classList.remove('hide');
+  $('#who').innerHTML = `<div class="nm">${esc(S.user.name)}</div><div class="rl">${ROLES[S.user.role]}</div><div class="logout" onclick="logout()">⎋ Sign out</div>`;
+  await buildNav();
+  go(S.page);
+}
+
+/* ============ navigation ============ */
+const can = {
+  create: () => ['site', 'checker', 'admin'].includes(S.user.role),
+  review: () => ['checker', 'purchase', 'operations', 'accounts', 'admin'].includes(S.user.role),
+  admin: () => S.user.role === 'admin',
+  audit: () => S.user.role === 'admin',                        // P30 — Accounts has no Audit Trail
+  addFunds: () => ['admin', 'accounts'].includes(S.user.role),
+  payments: () => ['accounts', 'admin'].includes(S.user.role), // P31 — Approved Payments tab
+  analytics: () => ['accounts', 'admin'].includes(S.user.role), // Analytics/insights charts
+  funds: () => !['site', 'purchase', 'operations'].includes(S.user.role),   // P7/P27 — site, purchase & operations have no Funds & Balance
+  reports: () => !['site', 'checker', 'purchase', 'operations'].includes(S.user.role),  // P7/P20/P27 — site, checker, purchase & operations have no Reports & Export
+  reviewTab: () => can.review() && S.user.role !== 'checker',  // P20 — checker reviews from the dashboard, not a separate queue
+  reviewOnly: () => ['purchase', 'operations'].includes(S.user.role),  // P27 — purchaser (and operations, same rule) sees only the Review Queue
+};
+function pendingForMe(list) {
+  const r = S.user.role;
+  if (r === 'checker') return list.filter(e => e.status === 'Submitted');
+  if (r === 'purchase') return list.filter(e => e.status === 'Checked');
+  if (r === 'operations') return list.filter(e => e.status === 'Purchase Reviewed');
+  if (r === 'accounts') return list.filter(e => ['Operations Reviewed', 'Accounts Reviewed'].includes(e.status));
+  if (r === 'admin') return list.filter(e => ['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(e.status));
+  return [];
+}
+async function buildNav() {
+  let pend = 0;
+  if (can.reviewTab()) { try { pend = pendingForMe(await api('GET', '/expenses')).length; } catch (e) {} }
+  const items = [];
+  if (!can.reviewOnly()) items.push({ grp: 'Overview' }, { id: 'dashboard', ic: '▦', label: 'Dashboard' }, { id: 'expenses', ic: '☰', label: 'All Expenses' });
+  if (can.reviewTab()) items.push({ id: 'review', ic: '✓', label: 'Review Queue', badge: pend || '' });
+  if (can.funds()) items.push({ id: 'funds', ic: '₹', label: 'Funds & Balance' });
+  if (can.reports()) items.push({ grp: 'Reports' }, { id: 'reports', ic: '⤓', label: 'Reports & Export' });
+  if (can.payments()) items.push({ id: 'payments', ic: '✔', label: 'Approved Payments' });
+  if (can.analytics()) items.push({ id: 'analytics', ic: '📊', label: 'Analytics' });
+  if (can.admin() || can.audit()) {
+    items.push({ grp: 'Administration' });
+    if (can.admin()) items.push({ id: 'users', ic: '◎', label: 'Users & Access' });
+    if (can.admin()) items.push({ id: 'masters', ic: '⚙', label: 'Masters' });
+    if (can.audit()) items.push({ id: 'audit', ic: '⌗', label: 'Audit Trail' });
+  }
+  $('#nav').innerHTML = items.map(it => it.grp
+    ? `<div class="group">${it.grp}</div>`
+    : `<a data-pg="${it.id}" onclick="go('${it.id}')"><span>${it.ic}</span><span>${it.label}</span>${it.badge ? `<span class="badge">${it.badge}</span>` : ''}</a>`).join('');
+
+  const bn = [];
+  if (!can.reviewOnly()) bn.push({ id: 'dashboard', ic: '▦', label: 'Home' }, { id: 'expenses', ic: '☰', label: 'Expenses' });
+  if (can.create()) bn.push({ id: '__new', ic: '+', label: 'New', add: true });
+  if (can.reviewTab()) bn.push({ id: 'review', ic: '✓', label: 'Review', badge: pend || '' });
+  if (can.funds()) bn.push({ id: 'funds', ic: '₹', label: 'Balance' });
+  if (can.payments()) bn.push({ id: 'payments', ic: '✔', label: 'Pay' });
+  $('#botnav').innerHTML = bn.map(it => `<a data-pg="${it.id}" class="${it.add ? 'add' : ''}" onclick="${it.add ? 'ExpenseForm.open()' : `go('${it.id}')`}"><span class="ic">${it.ic}</span><span>${it.label}</span>${it.badge ? `<span class="badge">${it.badge}</span>` : ''}</a>`).join('');
+}
+const TITLES = {
+  dashboard: ['Dashboard', 'Overview of site expenses'], expenses: ['All Expenses', 'Every recorded voucher'],
+  review: ['Review Queue', 'Items awaiting your action'], funds: ['Funds & Balance', 'Money given vs spent per project'],
+  reports: ['Reports & Export', 'Filter and download CSV'], users: ['Users & Access', 'Accounts, roles & project access'],
+  masters: ['Masters', 'Categories, projects & locations'], audit: ['Audit Trail', 'Complete activity log'],
+  payments: ['Approved Payments', 'Select approved vouchers to pay'],
+  analytics: ['Analytics', 'Spend comparisons & trends'],
+};
+async function go(pg) {
+  if (can.reviewOnly() && pg !== 'review') pg = 'review'; // P27 — purchaser only has the Review Queue
+  S.page = pg;
+  $$('#nav a').forEach(a => a.classList.toggle('active', a.dataset.pg === pg));
+  $$('#botnav a').forEach(a => a.classList.toggle('active', a.dataset.pg === pg));
+  $('#side').classList.remove('open');
+  $('#topActions').innerHTML = '';
+  const t = TITLES[pg] || ['', '']; $('#pageTitle').textContent = t[0]; $('#pageCrumb').textContent = t[1];
+  $('#content').innerHTML = '<div class="empty">Loading…</div>';
+  try { await Views[pg](); } catch (e) { $('#content').innerHTML = `<div class="card card-pad"><div class="empty">${esc(e.message)}</div></div>`; }
+}
+
+/* ============ modal ============ */
+const Modal = {
+  open(html) { $('#modalRoot').innerHTML = `<div class="modal-bg" onclick="if(event.target===this)Modal.close()"><div class="modal">${html}</div></div>`; },
+  close() { $('#modalRoot').innerHTML = ''; },
+};
+
+/* ============ shared table ============ */
+function slaBadge(e) {
+  if (!e.sla || !e.sla.dueAt) return '';
+  const left = e.sla.dueAt - Date.now();
+  const d = Math.ceil(left / 86400000);
+  if (left < 0) { const over = Math.max(1, Math.floor(-left / 86400000)); return `<span class="tag" style="background:#fdecea;color:#c0392b" title="${esc(e.sla.label)} overdue">⏰ Overdue ${over}d</span>`; }
+  const soon = d <= 1;
+  return `<span class="tag" style="background:${soon ? '#fff3e0' : '#eef0f3'};color:${soon ? '#b9770e' : '#5b6472'}" title="${esc(e.sla.label)} due">⏳ ${d}d left</span>`;
+}
+function expenseTable(rows) {
+  if (!rows.length) return '<div class="empty">No matching expenses.</div>';
+  return `<div class="table-wrap"><table><thead><tr><th>Voucher</th><th>Date</th><th>Details</th><th>Category</th><th>Project</th><th class="num">Amount</th><th>Status</th></tr></thead><tbody>${rows.map(e => `<tr class="click" onclick="Detail.open('${e.id}')"><td class="mono">${esc(e.voucher_no)}</td><td>${fmtDate(e.date)}</td><td>${esc((e.details || '').slice(0, 42))}${(e.details || '').length > 42 ? '…' : ''} ${e.evidenceCount ? `<span class="tag">📎${e.evidenceCount}</span>` : ''}${e.paid ? ' <span class="tag">💰 Paid</span>' : ''} ${slaBadge(e)}</td><td><span class="tag">${esc(e.categoryName)}</span></td><td>${esc(e.projectCode)}</td><td class="num">${money(e.amount)}</td><td>${pill(e.status)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+/* ============ views ============ */
+const Views = {};
+Views.dashboard = async function () {
+  const [ex, fundsData] = await Promise.all([api('GET', '/expenses'), api('GET', '/funds')]);
+  const total = ex.reduce((s, e) => s + (+e.amount || 0), 0);
+  // P5/18 — "In Review" reflects only vouchers that currently have an active (open) query
+  const inReview = ex.filter(e => e.status === 'Query').length;
+  // P3/16 — dashboard lists only not-yet-approved vouchers, with queried ones pinned on top
+  const pending = ex.filter(e => !['Approved', 'Rejected'].includes(e.status))
+    .slice().sort((a, b) => {
+      const qa = a.status === 'Query' ? 0 : 1, qb = b.status === 'Query' ? 0 : 1;
+      return qa !== qb ? qa - qb : (b.created_at || 0) - (a.created_at || 0);
+    });
+  const t = fundsData.totals;   // role-aware ledger: {received, spent, balance, [distributed]}
+  const role = S.user.role;
+  const given = t.received || 0, balance = t.balance || 0, spent = t.spent || 0;
+  const recvLbl = role === 'site' ? 'allocated to this site' : role === 'checker' ? 'received from accounts' : 'released to projects';
+  const balSub = role === 'checker' ? `${money(t.distributed || 0)} to sites` : `${money(spent)} spent`;
+  $('#content').innerHTML = `
+    <div class="grid stat-row" style="margin-bottom:20px">
+      <div class="stat accent"><div class="lab">Total Expenses</div><div class="val">${money(total)}</div><div class="sub2">${ex.length} vouchers</div></div>
+      <div class="stat green"><div class="lab">Funds Received</div><div class="val">${money(given)}</div><div class="sub2">${recvLbl}</div></div>
+      <div class="stat blue"><div class="lab">Balance In Hand</div><div class="val" style="color:${balance >= 0 ? 'var(--green)' : 'var(--red)'}">${money(balance)}</div><div class="sub2">${balSub}</div></div>
+      <div class="stat amber"><div class="lab">In Review</div><div class="val">${inReview}</div><div class="sub2">active queries</div></div>
+    </div>
+    <div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>Pending Vouchers</h3><div class="csub" style="margin:0">Not yet approved · queries shown first</div></div><button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="go('expenses')">View all →</button></div>${expenseTable(pending)}</div>`;
+  if (can.create()) $('#topActions').innerHTML = `<button class="btn btn-primary" onclick="ExpenseForm.open()">+ New Expense</button>`;
+};
+
+const CHART_PALETTE = ['#4f7cff', '#22a06b', '#e0a400', '#8b5cf6', '#0ea5e9', '#e5484d', '#14b8a6', '#f97316', '#6366f1', '#84cc16'];
+function fmtMonth(ym) { if (!ym) return '—'; const p = String(ym).split('-'); const n = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']; return (n[(+p[1]) - 1] || p[1]) + ' ' + p[0]; }
+function barChart(rows, opts) {
+  opts = opts || {};
+  if (!rows.length) return '<div class="empty">No data yet.</div>';
+  const fmt = opts.fmt || money;
+  const max = Math.max(1, ...rows.map(r => r.value || 0));
+  return '<div style="display:flex;flex-direction:column;gap:10px">' + rows.map((r, i) => {
+    const pct = Math.max(1.5, (r.value || 0) / max * 100);
+    const color = r.color || CHART_PALETTE[i % CHART_PALETTE.length];
+    return `<div style="display:flex;align-items:center;gap:10px">
+      <div style="width:132px;flex:0 0 132px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(r.label)}">${esc(r.label)}</div>
+      <div style="flex:1;background:var(--line);border-radius:6px;height:22px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${color};border-radius:6px"></div></div>
+      <div style="width:118px;flex:0 0 118px;text-align:right;font-size:13px;font-variant-numeric:tabular-nums">${fmt(r.value || 0)}${opts.count && r.count != null ? ` <span style="color:var(--muted,#8a8a8a)">(${r.count})</span>` : ''}</div>
+    </div>`;
+  }).join('') + '</div>';
+}
+function utilisationChart(rows) {
+  if (!rows.length) return '<div class="empty">No allocations yet.</div>';
+  const max = Math.max(1, ...rows.map(r => r.allocated || 0));
+  return '<div style="display:flex;flex-direction:column;gap:10px">' + rows.map(r => {
+    const barW = Math.max(1.5, (r.allocated || 0) / max * 100);
+    const fillW = r.allocated > 0 ? Math.min(100, (r.spent || 0) / r.allocated * 100) : 0;
+    const over = (r.spent || 0) > (r.allocated || 0);
+    return `<div style="display:flex;align-items:center;gap:10px">
+      <div style="width:120px;flex:0 0 120px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(r.name)}">${esc(r.name)}</div>
+      <div style="flex:1;background:var(--line);border-radius:6px;height:22px;overflow:hidden"><div style="width:${barW}%;height:100%;background:#dbe4ff;border-radius:6px"><div style="width:${fillW}%;height:100%;background:${over ? '#e5484d' : '#4f7cff'};border-radius:6px"></div></div></div>
+      <div style="width:158px;flex:0 0 158px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums">${money(r.spent)} / ${money(r.allocated)} · <span style="color:${r.balance >= 0 ? 'var(--green)' : 'var(--red)'}">${money(r.balance)}</span></div>
+    </div>`;
+  }).join('') + '</div>';
+}
+Views.analytics = async function () {
+  const d = await api('GET', '/analytics');
+  const t = d.totals, b = d.burn;
+  const sva = [
+    { label: 'Total (committed)', value: t.total, color: '#4f7cff' },
+    { label: 'Approved', value: t.approved, color: '#22a06b' },
+    { label: 'Paid', value: t.paid, color: '#0ea5e9' },
+    { label: 'Pending', value: t.pending, color: '#e0a400' },
+    { label: 'Rejected', value: t.rejected, color: '#e5484d' },
+  ];
+  const catRows = d.byCategory.map(c => ({ label: c.name, value: c.amount, count: c.count }));
+  const projRows = d.byProject.map(p => ({ label: (p.code ? p.code + ' · ' : '') + p.name, value: p.amount, count: p.count }));
+  const monthRows = d.byMonth.map(mo => ({ label: fmtMonth(mo.month), value: mo.amount }));
+  const cnt = v => String(v);
+  const num = v => v == null ? '—' : (+v).toFixed(1);
+  const card = (title, sub, body) => `<div class="card" style="margin-bottom:18px"><div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>${title}</h3>${sub ? `<div class="csub" style="margin:0">${sub}</div>` : ''}</div><div style="padding:16px">${body}</div></div>`;
+  $('#content').innerHTML =
+    `<h3 style="margin:2px 0 12px;color:var(--muted,#666)">Spend</h3>` +
+    card('Actual vs Approved Spend', 'Where the money sits across the workflow', barChart(sva)) +
+    card('Spend by Category', 'Submitted vouchers (excludes drafts & rejected)', barChart(catRows, { count: true })) +
+    card('Spend by Site / Project', 'Submitted vouchers (excludes drafts & rejected)', barChart(projRows, { count: true })) +
+    card('Monthly Spend', 'Last 6 months, by expense date', barChart(monthRows)) +
+    `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Money health</h3>` +
+    `<div class="grid stat-row" style="margin-bottom:18px">
+       <div class="stat green"><div class="lab">Funds Released</div><div class="val">${money(b.released)}</div></div>
+       <div class="stat accent"><div class="lab">Spent</div><div class="val">${money(b.spent)}</div></div>
+       <div class="stat blue"><div class="lab">Remaining</div><div class="val" style="color:${b.remaining >= 0 ? 'var(--green)' : 'var(--red)'}">${money(b.remaining)}</div><div class="sub2">~${money(b.avgMonthlyBurn)}/mo · runway ${b.runwayMonths == null ? '—' : num(b.runwayMonths) + ' mo'}</div></div>
+     </div>` +
+    card('Allocation Utilisation by Site', 'Spent within allocation (red bar = over-allocated)', utilisationChart(d.allocationBySite)) +
+    card('Unpaid Outflow — ' + money(d.unpaidTotal), 'Approved but not yet paid, by project', barChart(d.unpaidByProject.map(p => ({ label: (p.code ? p.code + ' · ' : '') + p.name, value: p.amount })))) +
+    `<div class="card" style="margin-bottom:18px"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>Budget vs Actual — ${fmtMonth(new Date().toISOString().slice(0, 7))}</h3><div class="csub" style="margin:0">Incurred spend within this month's budget (red bar = over budget)</div></div><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="BudgetsAdmin.set()">+ Set Budget</button></div><div style="padding:16px">${
+      d.budgetVsActual.length
+        ? utilisationChart(d.budgetVsActual.map(x => ({ name: (x.code ? x.code + ' · ' : '') + x.name, allocated: x.budget, spent: x.incurred, balance: x.variance })))
+        : '<div class="empty">No budgets set for this month yet.</div>'
+    }</div></div>` +
+    `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Workflow speed</h3>` +
+    card('Approval Turnaround by Stage', 'Average days at each step', barChart(d.turnaround.map(s => ({ label: s.stage, value: s.avgDays, count: s.count })), { fmt: v => v + ' d', count: true })) +
+    card('SLA Status', 'Pending vouchers: on time vs overdue', barChart([{ label: 'On track', value: d.sla.onTrack, color: '#22a06b' }, { label: 'Overdue', value: d.sla.overdue, color: '#e5484d' }], { fmt: cnt })) +
+    card('Pending Aging', 'How long pending vouchers have waited', barChart(d.aging.map(a => ({ label: a.bucket, value: a.count })), { fmt: cnt })) +
+    card('Throughput per Approver', 'Approval actions cleared', barChart(d.throughput.map(x => ({ label: x.name + (x.role && ROLES[x.role] ? ' · ' + ROLES[x.role] : ''), value: x.cleared })), { fmt: cnt }));
+};
+Views.payments = async function () {
+  const ex = await api('GET', '/expenses');
+  const list = ex.filter(e => e.status === 'Approved' && !e.paid);
+  const total = list.reduce((s, e) => s + (+e.amount || 0), 0);
+  const rows = list.map(e => `<tr>
+      <td><input type="checkbox" class="pay-cb" value="${e.id}"></td>
+      <td class="mono">${esc(e.voucher_no)}</td><td>${fmtDate(e.date)}</td>
+      <td>${esc((e.details || '').slice(0, 40))}</td><td>${esc(e.projectCode)}</td>
+      <td class="num">${money(e.amount)}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="Detail.open('${e.id}')">View</button></td></tr>`).join('')
+    || '<tr><td colspan="7"><div class="empty">No approved vouchers awaiting payment.</div></td></tr>';
+  $('#content').innerHTML = `
+    <div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)">
+      <div><h3>Approved Payments</h3><div class="csub" style="margin:0">${list.length} voucher(s) awaiting payment · ${money(total)}</div></div>
+      <button class="btn btn-primary" style="margin-left:auto" onclick="Views._confirmPay()">Confirm Payment</button></div>
+    <div class="table-wrap"><table><thead><tr><th><input type="checkbox" onclick="Views._toggleAllPay(this)"></th><th>Voucher</th><th>Date</th><th>Details</th><th>Project</th><th class="num">Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+};
+Views._toggleAllPay = function (master) { $$('.pay-cb').forEach(cb => { cb.checked = master.checked; }); };
+Views._confirmPay = async function () {
+  const ids = $$('.pay-cb').filter(cb => cb.checked).map(cb => cb.value);
+  if (!ids.length) { toast('Select at least one voucher', 'err'); return; }
+  if (!confirm(`Confirm payment for ${ids.length} voucher(s)? They will move out of this list.`)) return;
+  try { const r = await api('POST', '/payments', { ids }); toast(`${r.paid} marked paid`, 'ok'); go('payments'); }
+  catch (e) { toast(e.message, 'err'); }
+};
+
+Views.expenses = async function () {
+  const cats = S.categories, prj = S.projects;
+  $('#content').innerHTML = `
+    <div class="toolbar card card-pad" style="padding:12px 14px">
+      <input id="fx-q" placeholder="Search details / voucher…" oninput="Views._filterExp()">
+      <select id="fx-status" onchange="Views._filterExp()"><option value="">All statuses</option>${Object.keys(PILL).map(s => `<option>${s}</option>`).join('')}</select>
+      <select id="fx-cat" onchange="Views._filterExp()"><option value="">All categories</option>${cats.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>
+      <select id="fx-prj" onchange="Views._filterExp()"><option value="">All projects</option>${prj.map(p => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select>
+      <div class="spacer"></div><span id="fx-count" class="csub" style="margin:0"></span>
+    </div>
+    <div class="card" id="fx-table"></div>`;
+  if (can.create()) $('#topActions').innerHTML = `<button class="btn btn-primary" onclick="ExpenseForm.open()">+ New Expense</button>`;
+  Views._allExp = await api('GET', '/expenses');
+  Views._filterExp();
+};
+Views._filterExp = function () {
+  let rows = Views._allExp || [];
+  const q = ($('#fx-q').value || '').toLowerCase(), st = $('#fx-status').value, c = $('#fx-cat').value, p = $('#fx-prj').value;
+  if (q) rows = rows.filter(e => (e.details || '').toLowerCase().includes(q) || e.voucher_no.toLowerCase().includes(q));
+  if (st) rows = rows.filter(e => e.status === st);
+  if (c) rows = rows.filter(e => e.category_id === c);
+  if (p) rows = rows.filter(e => e.project_id === p);
+  $('#fx-table').innerHTML = expenseTable(rows);
+  $('#fx-count').textContent = `${rows.length} vouchers · ${money(rows.reduce((s, e) => s + (+e.amount || 0), 0))}`;
+};
+
+Views.review = async function () {
+  const rows = pendingForMe(await api('GET', '/expenses'));
+  const hint = { checker: 'Submitted items awaiting your check.', purchase: 'Checked items awaiting purchase review.', operations: 'Purchase-reviewed items awaiting operations review.', accounts: 'Items awaiting accounts review / approval.', admin: 'All items in the review pipeline.' }[S.user.role] || '';
+  $('#content').innerHTML = `<div class="card card-pad" style="margin-bottom:16px;display:flex;align-items:center"><div class="csub" style="margin:0">${esc(hint)}</div><span class="tag" style="margin-left:auto">${rows.length} pending</span></div><div class="card">${expenseTable(rows)}</div>`;
+};
+
+Views.funds = async function () {
+  const d = await api('GET', '/funds');
+  const t = d.totals;
+  if (d.role === 'checker') {
+    const balRows = d.balances.map(b => `<tr><td><b>${esc(b.code)}</b> · ${esc(b.name)}</td><td class="num mono">${money(b.given)}</td><td class="num mono">${money(b.distributed)}</td><td class="num mono ${b.available >= 0 ? 'bal-pos' : 'bal-neg'}">${money(b.available)}</td></tr>`).join('') || '<tr><td colspan="4"><div class="empty">No projects in your access</div></td></tr>';
+    const siteRows = (d.siteAllocations || []).map(s => `<tr><td>${esc(s.userName)}</td><td class="num mono">${money(s.allocated)}</td><td class="num mono">${money(s.spent)}</td><td class="num mono ${s.balance >= 0 ? 'bal-pos' : 'bal-neg'}">${money(s.balance)}</td></tr>`).join('') || '<tr><td colspan="4"><div class="empty">No allocations yet</div></td></tr>';
+    const fundList = d.funds.map(f => `<tr><td>${fmtDate(f.date)}</td><td>${esc(f.projectCode || '—')}</td><td>${f.kind === 'allocation' ? '→ ' + esc(f.toUserName || 'site') : 'Received from Accounts'}</td><td class="num"><span class="tag" style="background:${f.kind === 'allocation' ? 'var(--line)' : 'var(--green-soft)'};color:${f.kind === 'allocation' ? 'var(--ink)' : 'var(--green)'}">${f.kind === 'allocation' ? '− ' : '+ '}${money(f.amount)}</span></td><td>${esc(f.note || '—')}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty">No fund movements yet</div></td></tr>';
+    $('#content').innerHTML = `
+      <div class="grid stat-row" style="margin-bottom:18px">
+        <div class="stat green"><div class="lab">Received</div><div class="val">${money(t.received)}</div><div class="sub2">from accounts</div></div>
+        <div class="stat accent"><div class="lab">Distributed</div><div class="val">${money(t.distributed)}</div><div class="sub2">to sites</div></div>
+        <div class="stat blue"><div class="lab">Balance In Hand</div><div class="val" style="color:${t.balance >= 0 ? 'var(--green)' : 'var(--red)'}">${money(t.balance)}</div><div class="sub2">${money(t.spent)} own spend</div></div>
+      </div>
+      <div class="card" style="margin-bottom:18px"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>By Project</h3><div class="csub" style="margin:0">Received − Distributed = available to distribute</div></div><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="FundsAdmin.allocate()">+ Allocate to Site</button></div><div class="table-wrap"><table><thead><tr><th>Project</th><th class="num">Received</th><th class="num">Distributed</th><th class="num">Available</th></tr></thead><tbody>${balRows}</tbody></table></div></div>
+      <div class="card" style="margin-bottom:18px"><div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Site Allocations</h3></div><div class="table-wrap"><table><thead><tr><th>Site</th><th class="num">Allocated</th><th class="num">Spent</th><th class="num">Balance</th></tr></thead><tbody>${siteRows}</tbody></table></div></div>
+      <div class="card"><div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Fund Movements</h3></div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Project</th><th>Type</th><th class="num">Amount</th><th>Note</th></tr></thead><tbody>${fundList}</tbody></table></div></div>`;
+    return;
+  }
+  // accounts / admin — project pool view
+  const balRows = d.balances.map(b => `<tr><td><b>${esc(b.code)}</b> · ${esc(b.name)}</td><td class="num mono">${money(b.given)}</td><td class="num mono">${money(b.spent)}</td><td class="num mono ${b.balance >= 0 ? 'bal-pos' : 'bal-neg'}">${money(b.balance)}</td></tr>`).join('') || '<tr><td colspan="4"><div class="empty">No projects in your access</div></td></tr>';
+  const fundList = d.funds.map(f => `<tr><td>${fmtDate(f.date)}</td><td>${esc(f.projectCode || '—')}</td><td>${f.kind === 'allocation' ? '→ ' + esc(f.toUserName || 'site') : 'Released'}</td><td class="num"><span class="tag" style="background:var(--green-soft);color:var(--green)">+ ${money(f.amount)}</span></td><td>${esc(f.addedByName || '—')}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty">No funds recorded yet</div></td></tr>';
+  $('#content').innerHTML = `
+    <div class="grid stat-row" style="margin-bottom:18px">
+      <div class="stat green"><div class="lab">Funds Released</div><div class="val">${money(t.received)}</div><div class="sub2">to projects</div></div>
+      <div class="stat accent"><div class="lab">Spent</div><div class="val">${money(t.spent)}</div><div class="sub2">excludes rejected</div></div>
+      <div class="stat blue"><div class="lab">Balance In Hand</div><div class="val" style="color:${t.balance >= 0 ? 'var(--green)' : 'var(--red)'}">${money(t.balance)}</div></div>
+    </div>
+    <div class="card" style="margin-bottom:18px"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>Balance by Project</h3><div class="csub" style="margin:0">Released − Spent</div></div>${can.addFunds() ? `<button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="FundsAdmin.add()">+ Release Funds</button>` : ''}</div><div class="table-wrap"><table><thead><tr><th>Project</th><th class="num">Released</th><th class="num">Spent</th><th class="num">Balance</th></tr></thead><tbody>${balRows}</tbody></table></div></div>
+    <div class="card"><div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Fund Movements</h3></div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Project</th><th>Type</th><th class="num">Amount</th><th>By</th></tr></thead><tbody>${fundList}</tbody></table></div></div>`;
+};
+
+Views.reports = async function () {
+  const cats = S.categories, prj = S.projects;
+  $('#content').innerHTML = `<div class="card card-pad">
+    <h3>Report Filters</h3><div class="csub">Filter the dataset, then download CSV</div>
+    <div class="frow three" style="margin-top:6px">
+      <div class="field"><label>From</label><input type="date" id="rp-from"></div>
+      <div class="field"><label>To</label><input type="date" id="rp-to"></div>
+      <div class="field"><label>Status</label><select id="rp-status"><option value="">All</option>${Object.keys(PILL).map(s => `<option>${s}</option>`).join('')}<option value="__paid">Paid</option><option value="__unpaid">Approved (unpaid)</option></select></div>
+    </div>
+    <div class="frow"><div class="field"><label>Project</label><select id="rp-prj"><option value="">All</option>${prj.map(p => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></div></div>
+    <div style="margin-top:10px"><button class="btn btn-primary" onclick="Views._csv()">⤓ Download CSV</button></div>
+  </div>`;
+};
+Views._csv = function () {
+  const q = new URLSearchParams();
+  ['from', 'to', 'status'].forEach(k => { const v = $('#rp-' + k).value; if (v) q.set(k, v); });
+  const p = $('#rp-prj').value; if (p) q.set('projectId', p);
+  const a = document.createElement('a'); a.href = '/api/reports/expenses.csv?' + q.toString(); a.click();
+};
+
+Views.users = async function () {
+  const users = await api('GET', '/users');
+  Views._users = users;
+  $('#content').innerHTML = `<div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>User Accounts</h3><div class="csub" style="margin:0">${users.length} users</div></div><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="UsersAdmin.edit()">+ Create User</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Profile</th><th>Project Access</th><th>Status</th><th></th></tr></thead><tbody>${users.map(u => `<tr><td><b>${esc(u.name)}</b></td><td class="mono">${esc(u.username)}</td><td><span class="tag">${ROLES[u.role]}</span></td><td>${u.all_projects ? '<span class="tag" style="background:var(--accent-soft);color:var(--accent-d)">All</span>' : (u.project_ids.length ? u.project_ids.map(id => `<span class="tag">${esc((S.allProjects.find(p => p.id === id) || {}).code || '?')}</span>`).join(' ') : '<span class="tag">none</span>')}</td><td>${u.active ? '<span class="pill p-app">Active</span>' : '<span class="pill p-rej">Disabled</span>'}</td><td style="text-align:right"><button class="btn btn-ghost btn-sm" onclick="UsersAdmin.edit('${u.id}')">Edit</button>${u.id !== S.user.id ? `<button class="btn btn-ghost btn-sm" onclick="UsersAdmin.toggle('${u.id}')">${u.active ? 'Disable' : 'Enable'}</button>` : '<span class="tag">you</span>'}</td></tr>`).join('')}</tbody></table></div></div>`;
+};
+
+Views.masters = async function () {
+  return Views._master('categories');
+};
+Views._master = async function (which) {
+  const d = await api('GET', '/masters');          // all rows, active + inactive
+  Views._mastersData = d;
+  const list = d[which] || [];
+  const tabs = ['categories', 'projects', 'locations'];
+  const head = which === 'projects' ? '<th>Code</th><th>Name</th><th>Status</th><th></th>' : '<th>Name</th><th>Status</th><th></th>';
+  const statusPill = x => x.active ? '<span class="pill p-app">Active</span>' : '<span class="pill p-rej">Inactive</span>';
+  const toggleBtn = x => `<button class="btn btn-ghost btn-sm" onclick="Masters.toggle('${which}','${x.id}')">${x.active ? 'Disable' : 'Enable'}</button>`;
+  const renameBtn = x => `<button class="btn btn-ghost btn-sm" onclick="Masters.rename('${which}','${x.id}')">Rename</button>`;
+  const rows = list.map(x => which === 'projects'
+    ? `<tr><td class="mono">${esc(x.code)}</td><td>${esc(x.name)}</td><td>${statusPill(x)}</td><td style="text-align:right">${renameBtn(x)} ${toggleBtn(x)}</td></tr>`
+    : `<tr><td>${esc(x.name)}</td><td>${statusPill(x)}</td><td style="text-align:right">${renameBtn(x)} ${toggleBtn(x)}</td></tr>`).join('');
+  const colspan = which === 'projects' ? 4 : 3;
+  $('#content').innerHTML = `<div class="toolbar">${tabs.map(t => `<button class="btn ${t === which ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="Views._master('${t}')">${t}</button>`).join('')}</div>
+    <div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><h3 style="text-transform:capitalize">${which}</h3><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="Masters.add('${which}')">+ Add</button></div><div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${rows || `<tr><td colspan="${colspan}"><div class="empty">None yet</div></td></tr>`}</tbody></table></div></div>`;
+};
+
+Views.audit = async function () {
+  const log = await api('GET', '/audit');
+  $('#content').innerHTML = `<div class="card"><div class="table-wrap"><table><thead><tr><th>Time</th><th>User</th><th>Role</th><th>Action</th><th>Entity</th><th>Ref</th><th>Detail</th></tr></thead><tbody>${log.map(a => `<tr><td class="mono" style="white-space:nowrap">${fmtDT(a.at)}</td><td>${esc(a.user_name || '—')}</td><td><span class="tag">${ROLES[a.role] || a.role || '—'}</span></td><td><b>${esc(a.action)}</b></td><td>${esc(a.entity || '—')}</td><td class="mono">${esc(a.entity_id || '—')}</td><td class="csub" style="margin:0">${esc(a.detail || '')}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty">No activity</div></td></tr>'}</tbody></table></div></div>`;
+};
+
+/* ============ expense form ============ */
+const ExpenseForm = {
+  open() {
+    const cats = S.categories, prj = S.projects, loc = S.locations;
+    const opt = (arr, lab) => arr.map(x => `<option value="${x.id}">${esc(lab(x))}</option>`).join('');
+    Modal.open(`<div class="modal-head"><h3>New Expense Entry</h3><button class="x" onclick="Modal.close()">×</button></div>
+      <div class="modal-body">
+        <div class="frow three">
+          <div class="field"><label>Date *</label><input type="date" id="ef-date" value="${new Date().toISOString().slice(0, 10)}"${['site', 'checker'].includes(S.user.role) ? ` min="${new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)}"` : ''}></div>
+          <div class="field"><label>Amount (₹) *</label><input type="number" id="ef-amt" step="0.01" min="0" placeholder="0.00"></div>
+          <div class="field"><label>Category *</label><select id="ef-cat">${opt(cats, x => x.name)}</select></div>
+        </div>
+        <div class="field full"><label>Expense Details *</label><textarea id="ef-det" rows="2" placeholder="e.g. Diesel for Scorpio BR01PJ8719"></textarea></div>
+        <div class="frow three">
+          <div class="field"><label>Project *</label><select id="ef-prj">${opt(prj, x => x.code + ' · ' + x.name)}</select></div>
+          <div class="field"><label>Location</label><input id="ef-loc" list="ef-loc-list" placeholder="Type or pick a location" autocomplete="off"><datalist id="ef-loc-list">${loc.map(x => `<option value="${esc(x.name)}"></option>`).join('')}</datalist></div>
+          <div class="field"><label>Done by</label><input id="ef-by" value="${esc(S.user.name)}"></div>
+        </div>
+        <div class="frow">
+          <div class="field"><label>Bill received?</label><select id="ef-billrec"><option>No</option><option>Yes</option></select></div>
+          <div class="field"><label>Bill No.</label><input id="ef-billno" placeholder="optional"></div>
+        </div>
+        <div class="field full"><label>Remark</label><input id="ef-rem" placeholder="optional"></div>
+        <div class="section-t">Evidence photos</div>
+        <div class="drop" onclick="$('#ef-file').click()">📎 Tap to attach bill / payment / item photos or PDF
+          <input type="file" id="ef-file" accept="image/*,application/pdf" multiple style="display:none" onchange="ExpenseForm.preview()"></div>
+        <div class="thumbs" id="ef-thumbs"></div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+        <button class="btn btn-ghost" onclick="ExpenseForm.submit(true)">Save Draft</button>
+        <button class="btn btn-primary" onclick="ExpenseForm.submit(false)">Submit for review</button></div>`);
+  },
+  preview() {
+    const files = $('#ef-file').files;
+    $('#ef-thumbs').innerHTML = [...files].map(f => f.type === 'application/pdf'
+      ? `<div class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:11px;text-align:center;padding:4px;overflow:hidden">📄<br>${esc(f.name)}</div>`
+      : `<div class="thumb"><img src="${URL.createObjectURL(f)}"></div>`).join('');
+  },
+  async submit(asDraft, confirmDuplicate) {
+    const fd = new FormData();
+    const map = { date: 'ef-date', amount: 'ef-amt', categoryId: 'ef-cat', details: 'ef-det', projectId: 'ef-prj', location: 'ef-loc', expenseDoneBy: 'ef-by', billReceived: 'ef-billrec', billNo: 'ef-billno', remark: 'ef-rem' };
+    for (const k in map) fd.append(k, $('#' + map[k]).value);
+    fd.append('asDraft', asDraft ? 'true' : 'false');
+    if (confirmDuplicate) fd.append('confirmDuplicate', 'true');
+    const files = $('#ef-file').files; for (const f of files) fd.append('photos', f);
+    if (!$('#ef-date').value || !$('#ef-amt').value || !$('#ef-det').value.trim()) { toast('Date, amount and details required', 'err'); return; }
+    if (!asDraft && files.length === 0) { toast('Attach at least one photo/image before submitting', 'err'); return; } // P10
+    try { const r = await api('POST', '/expenses', fd, true); Modal.close(); toast((r.voucherNo) + (asDraft ? ' saved' : ' submitted'), 'ok'); await buildNav(); go(S.page); }
+    catch (e) {
+      if (e.data && e.data.duplicate) { if (confirm(e.message)) return ExpenseForm.submit(asDraft, true); return; } // P13
+      toast(e.message, 'err');
+    }
+  },
+};
+
+/* ============ detail + workflow ============ */
+const Detail = {
+  async open(id) {
+    let e;
+    try { e = await api('GET', '/expenses/' + id); } catch (err) { toast(err.message, 'err'); return; }
+    const dl = (k, v) => `<div class="dl">${k}</div><div class="dv">${v}</div>`;
+    const isPdf = f => (f.mime === 'application/pdf') || /\.pdf$/i.test(f.original_name || '');
+    const ev = e.evidence.length ? `<div class="thumbs">${e.evidence.map(f => isPdf(f)
+      ? `<a class="thumb" href="/api/evidence/${f.id}" target="_blank" rel="noopener" title="${esc(f.original_name || 'PDF')}" style="display:flex;flex-direction:column;align-items:center;justify-content:center;text-decoration:none;color:inherit">📄<span style="font-size:10px;max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.original_name || 'PDF')}</span></a>`
+      : `<div class="thumb" onclick="Detail.viewImg('${f.id}')"><img src="/api/evidence/${f.id}"></div>`).join('')}</div>` : '<div class="csub" style="margin:0">No evidence attached.</div>';
+    const acts = Detail.actions(e);
+    const tl = e.history.slice().reverse().map(h => `<div class="tl"><div style="font-weight:600;font-size:13px">${esc(h.action)}</div><div class="q-meta">${esc(h.byName)} · ${fmtDT(h.at)}</div>${h.detail ? `<div class="csub" style="margin:2px 0 0">${esc(h.detail)}</div>` : ''}</div>`).join('');
+    const q = e.queries.length ? e.queries.map(qq => Detail.queryCard(qq, e)).join('') : '<div class="csub" style="margin:0">No queries raised.</div>';
+    Modal.open(`<div class="modal-head"><h3>${esc(e.voucher_no)}</h3> ${pill(e.status)} ${slaBadge(e)}<button class="x" onclick="Modal.close()">×</button></div>
+      <div class="modal-body">
+        <div class="detail-grid">${dl('Date', fmtDate(e.date))}${dl('Amount', `<b class="mono">${money(e.amount)}</b>`)}${dl('Category', `<span class="tag">${esc(e.categoryName)}</span>`)}${dl('Project', esc(e.projectName))}${dl('Location', esc(e.locationName))}${dl('Done by', esc(e.expense_done_by || '—'))}${dl('Bill', esc(e.bill_received || '—') + (e.bill_no ? ` (${esc(e.bill_no)})` : ''))}${dl('Payment', e.paid ? `Paid${e.paid_at ? ' · ' + fmtDate(Number(e.paid_at)) : ''}` : 'Unpaid')}</div>
+        <div class="dl" style="border:0">Details</div><div class="dv" style="border:0;padding-top:2px">${esc(e.details)}</div>
+        ${e.remark ? `<div class="dl" style="border:0;margin-top:6px">Remark</div><div class="dv" style="border:0;padding-top:2px">${esc(e.remark)}</div>` : ''}
+        <div class="section-t">Evidence</div>${ev}
+        <div class="section-t">Review Progress</div>${Detail.ladder(e)}
+        ${acts.length ? `<div class="section-t">Actions</div><div class="actions-bar">${acts.join('')}</div>` : ''}
+        <div class="section-t">Queries</div>${q}
+        <div class="section-t">History</div><div class="timeline">${tl}</div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Close</button></div>`);
+  },
+  ladder(e) {
+    const ap = e.approvals || {};
+    const steps = [['check', 'Level 1 — Checked'], ['purchase', 'Level 2 — Purchase Reviewed'], ['operations', 'Level 3 — Operations Reviewed'], ['accounts', 'Level 4 — Accounts Reviewed'], ['approved', 'Final — Approved']];
+    const nowMap = { Submitted: 'check', Checked: 'purchase', 'Purchase Reviewed': 'operations', 'Operations Reviewed': 'accounts', 'Accounts Reviewed': 'approved' };
+    return steps.map(([k, label], i) => {
+      const a = ap[k]; let cls = 'wait', mark = i < 4 ? i + 1 : '✓', meta = 'Awaiting';
+      if (a) { cls = 'done'; mark = '✓'; meta = userName(a.by) + ' · ' + fmtDT(a.at); }
+      else if (nowMap[e.status] === k) { cls = 'now'; meta = 'Pending now'; }
+      return `<div class="lvl"><div class="dot ${cls}">${mark}</div><div><div class="lt">${label}</div><div class="lm">${esc(meta)}</div></div></div>`;
+    }).join('');
+  },
+  actions(e) {
+    const r = S.user.role, a = [], s = e.status, admin = r === 'admin';
+    if (s === 'Submitted' && (r === 'checker' || admin)) a.push(`<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','check')">✓ Mark Checked</button>`);
+    if (s === 'Checked' && (r === 'purchase' || admin)) a.push(`<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','purchase')">✓ Review (Purchase)</button>`);
+    if (s === 'Purchase Reviewed' && (r === 'operations' || admin)) a.push(`<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','operations')">✓ Review (Operations)</button>`);
+    if (s === 'Operations Reviewed' && (r === 'accounts' || admin)) a.push(`<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','accounts')">✓ Review (Accounts)</button>`);
+    if (s === 'Accounts Reviewed' && (r === 'accounts' || admin)) a.push(`<button class="btn btn-primary btn-sm" style="background:var(--green)" onclick="Detail.advance('${e.id}','approve')">✓ Approve</button>`);
+    if (['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(s) && can.review()) {
+      a.push(`<button class="btn btn-ghost btn-sm" onclick="Detail.raiseQuery('${e.id}')">? Raise Query</button>`);
+      a.push(`<button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="Detail.reject('${e.id}')">✕ Reject</button>`);
+    }
+    if ((r === 'site' && e.created_by === S.user.id && ['Draft', 'Submitted', 'Query'].includes(s))) a.push(`<button class="btn btn-ghost btn-sm" onclick="ExpenseForm._editNote()">✎ Edit on web</button>`);
+    return a;
+  },
+  async advance(id, step, reason) {
+    try { await api('POST', `/expenses/${id}/advance/${step}`, reason ? { reason } : undefined); toast('Updated', 'ok'); Modal.close(); await buildNav(); go(S.page); }
+    catch (e) {
+      if (e.data && e.data.needReason) { const r = prompt('This voucher is overdue. Enter a reason for the delay to proceed:'); if (r && r.trim()) return Detail.advance(id, step, r.trim()); return; }
+      toast(e.message, 'err');
+    }
+  },
+  reject(id) {
+    Modal.open(`<div class="modal-head"><h3>Reject Expense</h3><button class="x" onclick="Detail.open('${id}')">×</button></div><div class="modal-body"><div class="field full"><label>Reason *</label><textarea id="rj" rows="3"></textarea></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Detail.open('${id}')">Back</button><button class="btn btn-primary" style="background:var(--red)" onclick="Detail.doReject('${id}')">Reject</button></div>`);
+  },
+  async doReject(id) {
+    const reason = $('#rj').value.trim(); if (!reason) { toast('Reason required', 'err'); return; }
+    try { await api('POST', `/expenses/${id}/reject`, { reason }); toast('Rejected', 'ok'); Modal.close(); await buildNav(); go(S.page); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  raiseQuery(id) {
+    Modal.open(`<div class="modal-head"><h3>Raise Query</h3><button class="x" onclick="Detail.open('${id}')">×</button></div><div class="modal-body"><div class="csub" style="margin:0 0 10px">This query goes to the site person who created this voucher. When they resolve it, the voucher is re-submitted and the whole chain (checker → purchase → operations → accounts) re-approves.</div><div class="field full"><label>Query *</label><textarea id="q-msg" rows="3" placeholder="What needs to be clarified or corrected?"></textarea></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Detail.open('${id}')">Back</button><button class="btn btn-primary" onclick="Detail.doRaiseQuery('${id}')">Send</button></div>`);
+  },
+  async doRaiseQuery(id) {
+    const text = $('#q-msg').value.trim(); if (!text) { toast('Enter the query', 'err'); return; }
+    try { await api('POST', `/expenses/${id}/query`, { text }); toast('Query sent', 'ok'); Modal.close(); await buildNav(); go(S.page); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  queryCard(q, e) {
+    const meCreator = !!(e && e.created_by === S.user.id);
+    const canResolve = q.status === 'Open' && (q.assigned_to === S.user.id || S.user.role === 'admin' || meCreator);
+    const canReply = q.status === 'Open' && ([q.assigned_to, q.raised_by].includes(S.user.id) || meCreator);
+    return `<div class="query-item"><div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="pill ${q.status === 'Open' ? 'p-qry' : 'p-app'}">${q.status}</span><span class="csub" style="margin:0">${esc(q.raisedByName)} → ${esc(q.assignedToName)}</span></div>${q.thread.map(m => `<div class="q-msg">${esc(m.text)}<div class="q-meta">${esc(m.byName)} · ${fmtDT(m.at)}</div></div>`).join('')}${canReply ? `<div style="margin-top:8px;display:flex;gap:8px"><input id="qr-${q.id}" placeholder="Reply…" style="flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:7px"><button class="btn btn-ghost btn-sm" onclick="Detail.reply('${q.id}','${q.expense_id}')">Reply</button>${canResolve ? `<button class="btn btn-primary btn-sm" onclick="Detail.resolve('${q.id}','${q.expense_id}')">Resolve</button>` : ''}</div><div style="margin-top:6px"><input type="file" id="qf-${q.id}" accept="image/*,application/pdf" multiple style="display:none" onchange="Detail.attach('${q.id}','${q.expense_id}')"><button class="btn btn-ghost btn-sm" onclick="$('#qf-${q.id}').click()">📎 Add photo / PDF</button></div>` : ''}</div>`;
+  },
+  async reply(qid, eid) { const v = $('#qr-' + qid).value.trim(); if (!v) return; try { await api('POST', `/queries/${qid}/reply`, { text: v }); Detail.open(eid); } catch (e) { toast(e.message, 'err'); } },
+  async resolve(qid, eid, reason) {
+    try { await api('POST', `/queries/${qid}/resolve`, reason ? { reason } : undefined); toast('Resolved', 'ok'); Modal.close(); await buildNav(); go(S.page); }
+    catch (e) {
+      if (e.data && e.data.needReason) { const r = prompt('Query resolution is overdue. Enter a reason for the delay to proceed:'); if (r && r.trim()) return Detail.resolve(qid, eid, r.trim()); return; }
+      toast(e.message, 'err');
+    }
+  },
+  async attach(qid, eid) { const inp = $('#qf-' + qid); if (!inp || !inp.files.length) return; const fd = new FormData(); for (const f of inp.files) fd.append('files', f); try { await api('POST', `/queries/${qid}/attach`, fd, true); toast('Attached', 'ok'); Detail.open(eid); } catch (e) { toast(e.message, 'err'); } },
+  viewImg(id) { Modal.open(`<div class="modal-head"><h3>Evidence</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body" style="text-align:center"><img src="/api/evidence/${id}" style="max-width:100%;border-radius:8px"></div>`); },
+};
+ExpenseForm._editNote = () => toast('Editing is available on the desktop view in this build', 'ok');
+
+/* ============ funds / users / masters admin ============ */
+const FundsAdmin = {
+  add() {
+    Modal.open(`<div class="modal-head"><h3>Release Funds to Project</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body"><div class="frow"><div class="field"><label>Project *</label><select id="fd-prj">${S.projects.map(p => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></div><div class="field"><label>Date *</label><input type="date" id="fd-date" value="${new Date().toISOString().slice(0, 10)}"></div></div><div class="field full"><label>Amount (₹) *</label><input type="number" id="fd-amt" step="0.01" min="0"></div><div class="field full"><label>Note</label><input id="fd-note" placeholder="e.g. bank transfer ref"></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="FundsAdmin.save()">Save</button></div>`);
+  },
+  async save() {
+    const body = { projectId: $('#fd-prj').value, date: $('#fd-date').value, amount: $('#fd-amt').value, note: $('#fd-note').value.trim() };
+    if (!body.projectId || !body.date || !body.amount) { toast('Project, date and amount required', 'err'); return; }
+    try { await api('POST', '/funds', body); Modal.close(); toast('Funds recorded', 'ok'); go('funds'); } catch (e) { toast(e.message, 'err'); }
+  },
+  allocate() {
+    const sites = S.users.filter(u => u.role === 'site' && u.active);
+    Modal.open(`<div class="modal-head"><h3>Allocate Funds to Site</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body"><div class="frow"><div class="field"><label>Project *</label><select id="al-prj">${S.projects.map(p => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></div><div class="field"><label>Site *</label><select id="al-site">${sites.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></div></div><div class="frow"><div class="field"><label>Amount (₹) *</label><input type="number" id="al-amt" step="0.01" min="0"></div><div class="field"><label>Date *</label><input type="date" id="al-date" value="${new Date().toISOString().slice(0, 10)}"></div></div><div class="field full"><label>Note</label><input id="al-note" placeholder="optional"></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="FundsAdmin.saveAllocate()">Allocate</button></div>`);
+  },
+  async saveAllocate() {
+    const body = { projectId: $('#al-prj').value, toUser: $('#al-site').value, amount: $('#al-amt').value, date: $('#al-date').value, note: $('#al-note').value.trim() };
+    if (!body.projectId || !body.toUser || !body.amount || !body.date) { toast('Project, site, amount and date required', 'err'); return; }
+    try { await api('POST', '/funds/allocate', body); Modal.close(); toast('Allocated to site', 'ok'); go('funds'); } catch (e) { toast(e.message, 'err'); }
+  },
+};
+const BudgetsAdmin = {
+  set() {
+    const curMonth = new Date().toISOString().slice(0, 7);
+    Modal.open(`<div class="modal-head"><h3>Set Monthly Budget</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body"><div class="frow"><div class="field"><label>Project *</label><select id="bg-prj">${S.projects.map(p => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></div><div class="field"><label>Month *</label><input type="month" id="bg-period" value="${curMonth}"></div></div><div class="field full"><label>Budget (₹) *</label><input type="number" id="bg-amt" step="0.01" min="0"></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="BudgetsAdmin.save()">Save</button></div>`);
+  },
+  async save() {
+    const body = { projectId: $('#bg-prj').value, period: $('#bg-period').value, amount: $('#bg-amt').value };
+    if (!body.projectId || !body.period || !body.amount) { toast('Project, month and amount required', 'err'); return; }
+    try { await api('POST', '/budgets', body); Modal.close(); toast('Budget saved', 'ok'); go('analytics'); } catch (e) { toast(e.message, 'err'); }
+  },
+};
+const UsersAdmin = {
+  edit(id) {
+    const u = id ? (Views._users || []).find(x => x.id === id) : null;
+    const chips = S.allProjects.filter(p => p.active).map(p => `<span class="chip ${u && !u.all_projects && u.project_ids.includes(p.id) ? 'on' : ''}" data-pid="${p.id}" onclick="this.classList.toggle('on')">${esc(p.code)} · ${esc(p.name)}</span>`).join('');
+    const allOn = u ? u.all_projects : false;
+    Modal.open(`<div class="modal-head"><h3>${u ? 'Edit User' : 'Create User'}</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body">
+      <div class="frow"><div class="field"><label>Full name *</label><input id="us-name" value="${esc(u ? u.name : '')}"></div><div class="field"><label>Username *</label><input id="us-user" value="${esc(u ? u.username : '')}"></div></div>
+      <div class="frow"><div class="field"><label>Profile / Role *</label><select id="us-role">${Object.entries(ROLES).map(([k, v]) => `<option value="${k}" ${u && u.role === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div><div class="field"><label>${u ? 'Reset password' : 'Password *'}</label><input id="us-pass" type="text" placeholder="${u ? 'leave blank to keep' : 'set a password'}"></div></div>
+      <div class="field full"><label>Project access</label><label style="display:flex;gap:8px;align-items:center;text-transform:none;letter-spacing:0;color:var(--ink);margin:4px 0 8px"><input type="checkbox" id="us-all" ${allOn ? 'checked' : ''} onchange="$('#us-chips').style.opacity=this.checked?.4:1;$('#us-chips').style.pointerEvents=this.checked?'none':'auto'"> All projects (head office)</label><div class="chips" id="us-chips" style="${allOn ? 'opacity:.4;pointer-events:none' : ''}">${chips}</div></div>
+    </div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="UsersAdmin.save(${u ? `'${u.id}'` : 'null'})">Save</button></div>`);
+  },
+  async save(id) {
+    const allProjects = $('#us-all').checked;
+    const body = { name: $('#us-name').value.trim(), username: $('#us-user').value.trim(), role: $('#us-role').value, allProjects, projectIds: allProjects ? [] : $$('#us-chips .chip.on').map(c => c.dataset.pid) };
+    const pass = $('#us-pass').value; if (pass) body.password = pass;
+    if (!body.name || !body.username) { toast('Name and username required', 'err'); return; }
+    try {
+      if (id) { await api('PATCH', '/users/' + id, body); }
+      else { if (!pass) { toast('Password required for a new user', 'err'); return; } await api('POST', '/users', body); }
+      Modal.close(); toast('Saved', 'ok'); go('users');
+    } catch (e) { toast(e.message, 'err'); }
+  },
+  async toggle(id) { try { await api('POST', `/users/${id}/toggle`); go('users'); } catch (e) { toast(e.message, 'err'); } },
+};
+const Masters = {
+  add(type) {
+    const isProj = type === 'projects';
+    Modal.open(`<div class="modal-head"><h3>Add ${type.slice(0, -1)}</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body">${isProj ? `<div class="field"><label>Code *</label><input id="m-code" placeholder="e.g. DM"></div>` : ''}<div class="field full"><label>Name *</label><input id="m-name"></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="Masters.save('${type}')">Save</button></div>`);
+  },
+  async save(type) {
+    const body = { name: $('#m-name').value.trim() };
+    if (type === 'projects') body.code = $('#m-code').value.trim();
+    if (!body.name || (type === 'projects' && !body.code)) { toast('All fields required', 'err'); return; }
+    try { await api('POST', '/masters/' + type, body); Modal.close(); toast('Saved', 'ok'); await refreshLookups(); Views._master(type); } catch (e) { toast(e.message, 'err'); }
+  },
+  async toggle(type, id) { try { await api('POST', `/masters/${type}/${id}/toggle`); await refreshLookups(); Views._master(type); } catch (e) { toast(e.message, 'err'); } },
+  rename(type, id) {
+    const row = (Views._mastersData[type] || []).find(r => r.id === id);
+    if (!row) return;
+    const isProj = type === 'projects';
+    Modal.open(`<div class="modal-head"><h3>Rename ${type.slice(0, -1)}</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body">${isProj ? `<div class="field"><label>Code *</label><input id="m-code" value="${esc(row.code || '')}"></div>` : ''}<div class="field full"><label>Name *</label><input id="m-name" value="${esc(row.name || '')}"></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="Masters.saveRename('${type}','${id}')">Save</button></div>`);
+  },
+  async saveRename(type, id) {
+    const body = { name: $('#m-name').value.trim() };
+    if (type === 'projects') body.code = $('#m-code').value.trim();
+    if (!body.name || (type === 'projects' && !body.code)) { toast('All fields required', 'err'); return; }
+    try { await api('POST', `/masters/${type}/${id}/rename`, body); Modal.close(); toast('Renamed', 'ok'); await refreshLookups(); Views._master(type); } catch (e) { toast(e.message, 'err'); }
+  },
+};
+
+/* ============ boot ============ */
+window.go = go; window.logout = logout; window.Modal = Modal; window.Views = Views;
+window.ExpenseForm = ExpenseForm; window.Detail = Detail; window.FundsAdmin = FundsAdmin;
+window.UsersAdmin = UsersAdmin; window.Masters = Masters; window.$ = $;
+$('#lg-btn').addEventListener('click', doLogin);
+$('#lg-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+$('#menu-btn').addEventListener('click', () => $('#side').classList.toggle('open'));
+boot().catch(() => showLogin());

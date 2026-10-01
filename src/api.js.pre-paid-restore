@@ -1,0 +1,1061 @@
+'use strict';
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const bcrypt = require('bcryptjs');
+const {ZipArchive} = require('archiver');
+const { db, uid, now, loadUser, scopeOf, nextVoucher, logAudit, addHistory, toPaise, toRupees } = require('./db');
+
+const router = express.Router();
+const UP_DIR = path.join(__dirname, '..', 'uploads');
+if (!fs.existsSync(UP_DIR)) fs.mkdirSync(UP_DIR, { recursive: true });
+
+// ---------------------------------------------------------------- uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UP_DIR),
+  filename: (req, file, cb) => {
+    const ext = (path.extname(file.originalname) || '.jpg').toLowerCase().slice(0, 8);
+    cb(null, uid() + ext);
+  },
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 8 * 1024 * 1024, files: 12 },
+  fileFilter: (req, file, cb) => cb(null, /^image\//.test(file.mimetype) || file.mimetype === 'application/pdf'),
+});
+
+// ---------------------------------------------------------------- guards
+function requireAuth(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Not signed in' });
+  if (!req.user.active) return res.status(403).json({ error: 'Account disabled' });
+  next();
+}
+function requireRole(...roles) {
+  return (req, res, next) =>
+    roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Not permitted' });
+}
+router.use(requireAuth);
+
+// ---------------------------------------------------------------- scope
+// Pure functions -- no DB access, so these stay synchronous.
+function scopeClause(user, alias = 'e') {
+  const s = scopeOf(user);
+  const clauses = [];
+  const params = [];
+  if (!s.all) {
+    if (s.ids.length === 0) clauses.push('0=1');
+    else {
+      clauses.push(`${alias}.project_id IN (${s.ids.map(() => '?').join(',')})`);
+      params.push(...s.ids);
+    }
+  }
+  if (user.role === 'site') {
+    clauses.push(`${alias}.created_by = ?`);
+    params.push(user.id);
+  }
+  return { where: clauses.length ? ' AND ' + clauses.join(' AND ') : '', params };
+}
+function canSeeExpense(user, exp) {
+  const s = scopeOf(user);
+  if (!s.all && !s.ids.includes(exp.project_id)) return false;
+  if (user.role === 'site' && exp.created_by !== user.id) return false;
+  return true;
+}
+function inScope(user, projectId) {
+  const s = scopeOf(user);
+  return s.all || s.ids.includes(projectId);
+}
+
+// ---------------------------------------------------------------- lookups for display
+async function nameMaps() {
+  const [cats, projs, locs, users] = await Promise.all([
+    db.prepare('SELECT id,name FROM categories').all(),
+    db.prepare('SELECT id,code,name FROM projects').all(),
+    db.prepare('SELECT id,name FROM locations').all(),
+    db.prepare('SELECT id,name FROM users').all(),
+  ]);
+  return {
+    cat: Object.fromEntries(cats.map(r => [r.id, r.name])),
+    proj: Object.fromEntries(projs.map(r => [r.id, r])),
+    loc: Object.fromEntries(locs.map(r => [r.id, r.name])),
+    usr: Object.fromEntries(users.map(r => [r.id, r.name])),
+  };
+}
+const DAY_MS = 86400000;
+
+// P15/24/28/29 -- deadline for the voucher's current pending state (null if none)
+async function computeSla(e) {
+  if (e.status === 'Query') {
+    // Query resolution remains a separate 7-day SLA from the latest open query.
+    const q = await db
+      .prepare("SELECT created_at FROM queries WHERE expense_id=? AND status='Open' ORDER BY created_at DESC LIMIT 1")
+      .get(e.id);
+
+    if (q) {
+      return {
+        kind: 'query',
+        label: 'Query resolution',
+        dueAt: q.created_at + 7 * DAY_MS
+      };
+    }
+
+  } else if (e.status === 'Submitted') {
+    // Checker review starts from the current submission/re-submission time.
+    const anchor = e.submitted_at || e.created_at;
+
+    const expDate = Date.parse((e.date || '') + 'T00:00:00');
+
+    // A back-dated entry more than 7 days old is overdue immediately.
+    const dueAt =
+      (!isNaN(expDate) && (anchor - expDate) > 7 * DAY_MS)
+        ? (expDate + 2 * DAY_MS)
+        : (anchor + 2 * DAY_MS);
+
+    return {
+      kind: 'check',
+      label: 'Checker review',
+      dueAt
+    };
+
+  } else if (
+    ['Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed']
+      .includes(e.status)
+  ) {
+    const ap = JSON.parse(e.approvals || '{}');
+
+    // The current status tells us which step is ACTIVE.
+    // The previous completed step's timestamp is therefore
+    // the timestamp at which the current step was received.
+    const anchors = {
+      Checked: ap.check && ap.check.at,
+      'Purchase Reviewed': ap.purchase && ap.purchase.at,
+      'Operations Reviewed': ap.operations && ap.operations.at,
+      'Accounts Reviewed': ap.accounts && ap.accounts.at
+    };
+
+    const anchor = anchors[e.status];
+
+    if (anchor) {
+      return {
+        kind: 'review',
+        label: 'Approval',
+        dueAt: anchor + 2 * DAY_MS
+      };
+    }
+  }
+
+  return null;
+}
+
+function computeOverallSla(e) {
+  if (!e.created_at) return null;
+
+  const dueAt = e.created_at + 7 * DAY_MS;
+
+  return {
+    dueAt,
+    overdue: Date.now() > dueAt,
+  };
+}
+
+
+async function getPreviousDelays(e) {
+  const rows = await db.prepare(`
+    SELECT action, detail, at
+    FROM expense_history
+    WHERE expense_id=?
+      AND detail LIKE 'Delayed — reason:%'
+    ORDER BY at ASC
+  `).all(e.id);
+
+  return rows.map(h => ({
+    stage: h.action || 'Review',
+    reason: String(h.detail || '').replace(/^Delayed — reason:\s*/, ''),
+    at: h.at
+  }));
+}
+
+async function buildPaymentZip(res, expenses) {
+  const archive = new ZipArchive({
+    zlib: { level: 9 }
+  });
+
+  archive.on('error', err => {
+    throw err;
+  });
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="siteexpense-payments-${Date.now()}.zip"`
+  );
+
+  archive.pipe(res);
+
+  const cols = [
+    'Voucher',
+    'Date',
+    'Details',
+    'Category',
+    'Project',
+    'Location',
+    'Bill',
+    'Payment',
+    'Amount',
+    'Status',
+    'Paid',
+    'Paid On',
+    'Created By',
+  ];
+
+  const csvEsc = v => {
+    v = String(v ?? '');
+    return /[",\n]/.test(v)
+      ? '"' + v.replace(/"/g, '""') + '"'
+      : v;
+  };
+
+  const dcell = ms => {
+    const t = Number(ms);
+    return (ms && !isNaN(t))
+      ? new Date(t).toISOString().slice(0, 10)
+      : '';
+  };
+
+  const lines = [cols.join(',')];
+
+  for (const e of expenses) {
+    const p = e.project;
+
+    lines.push([
+      e.voucher_no,
+      e.date,
+      e.details,
+      e.categoryName,
+      p ? p.code : '',
+      e.locationName,
+      e.bill_received || '',
+      e.payment_status || '',
+      toRupees(e.amount),
+      e.status,
+      e.paid ? 'Yes' : 'No',
+      dcell(e.paid_at),
+      e.createdByName,
+    ].map(csvEsc).join(','));
+
+    const evidence = await db
+      .prepare('SELECT filename,original_name FROM evidence WHERE expense_id=? ORDER BY original_name ASC')
+      .all(e.id);
+
+    for (const f of evidence) {
+      const filePath = path.join(UP_DIR, f.filename);
+
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Attachment file is missing for ${e.voucher_no}: ${f.original_name || f.filename}`);
+      }
+
+      const safeName = path.basename(f.original_name || f.filename);
+
+      archive.file(filePath, {
+        name: `${e.voucher_no}/attachments/${safeName}`,
+      });
+    }
+  }
+
+  archive.append('\ufeff' + lines.join('\n'), {
+    name: 'payments.csv',
+  });
+
+  await archive.finalize();
+}
+
+async function decorate(e, m) {
+  const p = m.proj[e.project_id];
+  const [evCount, sla, previousDelays] = await Promise.all([
+    db.prepare('SELECT COUNT(*) c FROM evidence WHERE expense_id=?').get(e.id),
+    computeSla(e),
+    getPreviousDelays(e),
+  ]);
+  const overallSla = computeOverallSla(e);
+  return {
+    ...e,
+    amount: toRupees(e.amount),
+    approvals: JSON.parse(e.approvals || '{}'),
+    categoryName: m.cat[e.category_id] || '—',
+    projectCode: p ? p.code : '—',
+    projectName: p ? `${p.code} · ${p.name}` : '—',
+    locationName: m.loc[e.location_id] || '—',
+    createdByName: m.usr[e.created_by] || '—',
+    evidenceCount: evCount.c,
+    sla,
+    overallSla,
+    previousDelays,
+  };
+}
+
+// ---------------------------------------------------------------- submit-time rules
+// P14 -- entries may not be dated more than 7 days before today (site only; admin exempt)
+function entryDateError(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return 'Invalid date';
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diffDays = Math.floor((today.getTime() - d.getTime()) / 86400000);
+  if (diffDays > 7) return `Entries older than 7 days are not allowed (this one is ${diffDays} days old). Please ask an admin for any back-dated entry.`;
+  return null;
+}
+// P13 -- duplicate if (project+date+amount+category) match, or the bill number matches.
+// amount must be passed in already converted to paise (see toPaise).
+const normBill = s => String(s == null ? '' : s).toLowerCase().replace(/[\s\-/]/g, '').replace(/^0+(?=\d)/, '');
+async function findDuplicate({ projectId, date, amount, categoryId, billNo, excludeId }) {
+  const ex = excludeId || '';
+  const a = await db.prepare(
+    `SELECT voucher_no FROM expenses
+       WHERE status!='Rejected' AND id!=? AND project_id=? AND date=? AND amount=?
+         AND COALESCE(category_id,'')=COALESCE(?,'') LIMIT 1`
+  ).get(ex, projectId, date, amount, categoryId || null);
+  if (a) return { match: a.voucher_no, message: `Possible duplicate of ${a.voucher_no} — same project, date, amount and category. Submit anyway?` };
+  const bn = (billNo == null ? '' : String(billNo)).trim();
+  if (bn) {
+    const b2 = await db.prepare(
+      `SELECT voucher_no FROM expenses WHERE status!='Rejected' AND id!=? AND COALESCE(bill_no,'')=? LIMIT 1`
+    ).get(ex, bn);
+    if (b2) return { match: b2.voucher_no, message: `Possible duplicate — bill no. "${bn}" is already on ${b2.voucher_no}. Submit anyway?` };
+    // near-match: same bill number once spacing/dashes/leading zeros are ignored
+    const nb = normBill(bn);
+    if (nb) {
+      const candidates = await db.prepare(
+        `SELECT voucher_no, bill_no FROM expenses WHERE status!='Rejected' AND id!=? AND bill_no IS NOT NULL AND bill_no!=''`
+      ).all(ex);
+      const near = candidates.find(c => normBill(c.bill_no) === nb);
+      if (near) return { match: near.voucher_no, probable: true, message: `Bill no. "${bn}" looks like "${near.bill_no}" already on ${near.voucher_no} (differs only in spacing/formatting). Submit anyway?` };
+    }
+  }
+  return null;
+}
+// P2 -- resolve a typed/selected location name to an id, creating it on the fly if new
+async function resolveLocationId(name) {
+  const nm = (name || '').trim();
+  if (!nm) return null;
+  const existing = await db.prepare('SELECT id FROM locations WHERE lower(name)=lower(?) LIMIT 1').get(nm);
+  if (existing) return existing.id;
+  const id = uid();
+  await db.prepare('INSERT INTO locations (id,name,active) VALUES (?,?,1)').run(id, nm);
+  return id;
+}
+
+// ================================================================ BOOTSTRAP
+router.get('/bootstrap', async (req, res) => {
+  const u = req.user;
+  const [activeProjects, allProjects, categories, locations, users] = await Promise.all([
+    db.prepare('SELECT * FROM projects WHERE active=1').all(),
+    db.prepare('SELECT * FROM projects').all(),
+    db.prepare('SELECT * FROM categories WHERE active=1').all(),
+    db.prepare('SELECT * FROM locations WHERE active=1').all(),
+    db.prepare('SELECT id,name,role,active FROM users').all(),
+  ]);
+  res.json({
+    user: {
+      id: u.id, name: u.name, username: u.username, role: u.role,
+      allProjects: u.all_projects, projectIds: u.project_ids,
+    },
+    projects: activeProjects.filter(p => inScope(u, p.id)),
+    allProjects,       // admin views
+    categories,
+    locations,
+    users,
+  });
+});
+
+// ================================================================ EXPENSES
+router.get('/expenses', async (req, res) => {
+  const m = await nameMaps();
+  const sc = scopeClause(req.user, 'e');
+  const filters = [];
+  const params = [...sc.params];
+  if (req.query.status) { filters.push('e.status = ?'); params.push(req.query.status); }
+  if (req.query.projectId) { filters.push('e.project_id = ?'); params.push(req.query.projectId); }
+  if (req.query.categoryId) { filters.push('e.category_id = ?'); params.push(req.query.categoryId); }
+  const extra = filters.length ? ' AND ' + filters.join(' AND ') : '';
+  const rows = await db.prepare(
+    `SELECT e.* FROM expenses e WHERE 1=1 ${sc.where} ${extra} ORDER BY e.created_at DESC`
+  ).all(...params);
+  res.json(await Promise.all(rows.map(r => decorate(r, m))));
+});
+
+router.get('/expenses/:id', async (req, res) => {
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  if (!canSeeExpense(req.user, e)) return res.status(403).json({ error: 'Not permitted' });
+  const m = await nameMaps();
+  const [evidence, historyRows, queryRows] = await Promise.all([
+    db.prepare('SELECT id,original_name,mime FROM evidence WHERE expense_id=?').all(e.id),
+    db.prepare('SELECT * FROM expense_history WHERE expense_id=? ORDER BY at ASC').all(e.id),
+    db.prepare('SELECT * FROM queries WHERE expense_id=? ORDER BY created_at DESC').all(e.id),
+  ]);
+  const history = historyRows.map(h => ({ ...h, byName: m.usr[h.by_user] || '—' }));
+  const queries = await Promise.all(queryRows.map(async q => ({
+    ...q,
+    raisedByName: m.usr[q.raised_by], assignedToName: m.usr[q.assigned_to],
+    thread: (await db.prepare('SELECT * FROM query_messages WHERE query_id=? ORDER BY at ASC').all(q.id))
+      .map(t => ({ ...t, byName: m.usr[t.by_user] || '—' })),
+  })));
+  res.json({ ...(await decorate(e, m)), evidence, history, queries });
+});
+
+router.post('/expenses', upload.array('photos', 12), requireRole('site', 'checker', 'admin'), async (req, res) => {
+  const b = req.body;
+  if (!b.date || !b.amount || !b.details) return res.status(400).json({ error: 'Date, amount and details required' });
+  if (!inScope(req.user, b.projectId)) return res.status(403).json({ error: 'Project not in your access' });
+  const asDraft = b.asDraft === 'true' || b.asDraft === true;
+
+  // P14 -- site/checker cannot enter expenses dated more than 7 days ago
+  if (['site', 'checker'].includes(req.user.role)) {
+    const dErr = entryDateError(b.date);
+    if (dErr) return res.status(400).json({ error: dErr });
+  }
+  // P10 -- a photo/image is required to submit (a draft may be saved without one)
+  if (!asDraft && (!req.files || req.files.length === 0)) {
+    return res.status(400).json({ error: 'Please attach at least one photo/image of the bill or payment before submitting. (You can Save Draft without one.)' });
+  }
+  // P13 -- on submit, alert on a likely duplicate unless the user has confirmed
+  const confirmDup = b.confirmDuplicate === 'true' || b.confirmDuplicate === true;
+  if (!asDraft && !confirmDup) {
+    const dup = await findDuplicate({ projectId: b.projectId, date: b.date, amount: toPaise(b.amount), categoryId: b.categoryId, billNo: b.billNo });
+    if (dup) return res.status(409).json({ error: dup.message, duplicate: true, match: dup.match });
+  }
+
+  const id = uid();
+  const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId || null);
+  // A checker enters expenses directly and is their own checker, so the voucher starts
+  // already "Checked" (workflow begins at Purchase). Everyone else starts at "Submitted".
+  const checkerEntry = req.user.role === 'checker';
+  const status = asDraft ? 'Draft' : (checkerEntry ? 'Checked' : 'Submitted');
+  const approvals = (!asDraft && checkerEntry) ? JSON.stringify({ check: { by: req.user.id, at: now() } }) : '{}';
+  // voucher + evidence + history + audit succeed or roll back together
+  let voucher;
+  await db.transaction(async () => {
+    voucher = await nextVoucher();
+    await db.prepare(`INSERT INTO expenses
+      (id,voucher_no,date,amount,category_id,details,project_id,location_id,expense_done_by,
+       bill_received,bill_no,payment_status,remark,status,approvals,created_by,created_at,updated_at,submitted_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      id, voucher, b.date, toPaise(b.amount), b.categoryId || null, b.details, b.projectId,
+      locationId, b.expenseDoneBy || req.user.name, b.billReceived || 'No',
+      // payment_status is no longer taken from the submitter -- Accounts alone controls
+      // payment via the `paid` flag and the /payments endpoint (see decision below).
+      b.billNo || null, 'Pending', b.remark || null, status, approvals,
+      req.user.id, now(), now(), asDraft ? null : now()
+    );
+    for (const f of (req.files || [])) {
+      await db.prepare('INSERT INTO evidence (id,expense_id,filename,original_name,mime) VALUES (?,?,?,?,?)')
+        .run(uid(), id, f.filename, f.originalname, f.mimetype);
+    }
+    await addHistory(id, req.user.id, asDraft ? 'Created draft' : 'Submitted', 'Voucher created');
+    await logAudit(req.user, asDraft ? 'Created draft' : 'Submitted expense', 'expense', voucher, '₹' + b.amount);
+  });
+  res.json({ id, voucherNo: voucher });
+});
+
+// creator edits their own while still editable (or admin)
+router.patch('/expenses/:id', async (req, res) => {
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  const isOwnerEditable = req.user.role === 'site' && e.created_by === req.user.id &&
+    ['Draft', 'Submitted', 'Query'].includes(e.status);
+  if (!(isOwnerEditable || req.user.role === 'admin')) return res.status(403).json({ error: 'Not editable' });
+  const b = req.body;
+  const willSubmit = !b.asDraft;
+  // P14 -- keep the 7-day rule on edits too (site only)
+  if (req.user.role === 'site' && b.date) {
+    const dErr = entryDateError(b.date);
+    if (dErr) return res.status(400).json({ error: dErr });
+  }
+  // P10 -- cannot move a voucher to Submitted without at least one evidence image
+  if (willSubmit) {
+    const evCount = await db.prepare('SELECT COUNT(*) c FROM evidence WHERE expense_id=?').get(e.id);
+    if (evCount.c === 0) return res.status(400).json({ error: 'This voucher has no photo/image attached, so it cannot be submitted. Please attach evidence first.' });
+  }
+  const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId ?? e.location_id);
+  await db.prepare(`UPDATE expenses SET date=?,amount=?,category_id=?,details=?,location_id=?,
+    expense_done_by=?,bill_received=?,bill_no=?,remark=?,status=?,submitted_at=?,updated_at=? WHERE id=?`).run(
+    b.date ?? e.date, b.amount != null ? toPaise(b.amount) : e.amount, b.categoryId ?? e.category_id,
+    b.details ?? e.details, locationId, b.expenseDoneBy ?? e.expense_done_by,
+    b.billReceived ?? e.bill_received, b.billNo ?? e.bill_no,
+    b.remark ?? e.remark, (b.asDraft ? 'Draft' : 'Submitted'), (willSubmit ? now() : e.submitted_at), now(), e.id);
+  await addHistory(e.id, req.user.id, 'Edited', 'Updated voucher');
+  await logAudit(req.user, 'Edited expense', 'expense', e.voucher_no, '');
+  res.json({ ok: true });
+});
+
+// ---- sequential review ladder (server-enforced order) ----
+const FLOW = {
+  check:      { from: 'Submitted',           to: 'Checked',             role: 'checker',    key: 'check',      label: 'Checked' },
+  purchase:   { from: 'Checked',             to: 'Purchase Reviewed',   role: 'purchase',   key: 'purchase',   label: 'Reviewed by Purchase' },
+  operations: { from: 'Purchase Reviewed',   to: 'Operations Reviewed', role: 'operations', key: 'operations', label: 'Reviewed by Operations' },
+  accounts:   { from: 'Operations Reviewed', to: 'Accounts Reviewed',   role: 'accounts',   key: 'accounts',   label: 'Reviewed by Accounts' },
+  approve:    { from: 'Accounts Reviewed',   to: 'Approved',            role: 'accounts',   key: 'approved',   label: 'Approved' },
+};
+router.post('/expenses/:id/advance/:step', async (req, res) => {
+  const step = FLOW[req.params.step];
+  if (!step) return res.status(400).json({ error: 'Unknown step' });
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  if (req.user.role !== step.role && req.user.role !== 'admin')
+    return res.status(403).json({ error: `Only ${step.role} can do this step` });
+  if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
+  if (e.status !== step.from)
+    return res.status(409).json({ error: `Voucher must be "${step.from}" first (it is "${e.status}")` });
+  // Delay justification -- an overdue step cannot proceed without a reason for the delay
+  const sla = await computeSla(e);
+  const overdue = sla && Date.now() > sla.dueAt;
+  const reason = ((req.body && req.body.reason) || '').trim();
+  if (overdue && !reason) return res.status(409).json({ error: 'This action is overdue — please provide a reason for the delay to proceed.', needReason: true });
+  const approvals = JSON.parse(e.approvals || '{}');
+  approvals[step.key] = { by: req.user.id, at: now() };
+  // Atomic: re-check status in the same statement that changes it, so two
+  // simultaneous requests can't both succeed against the same "from" state.
+  const result = await db.prepare('UPDATE expenses SET status=?,approvals=?,updated_at=? WHERE id=? AND status=?')
+    .run(step.to, JSON.stringify(approvals), now(), e.id, step.from);
+  if (result.changes === 0) {
+    return res.status(409).json({ error: 'This voucher was just updated by someone else — please refresh and try again.' });
+  }
+  await addHistory(e.id, req.user.id, step.label, overdue ? ('Delayed — reason: ' + reason) : '');
+  await logAudit(req.user, step.label, 'expense', e.voucher_no, overdue ? ('delay: ' + reason) : '');
+  res.json({ ok: true, status: step.to });
+});
+
+router.post('/expenses/:id/reject', requireRole('checker', 'purchase', 'operations', 'accounts', 'admin'), async (req, res) => {
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
+  if (!['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(e.status))
+    return res.status(409).json({ error: 'Cannot reject at this stage' });
+  const reason = (req.body.reason || '').trim();
+  if (!reason) return res.status(400).json({ error: 'Reason required' });
+  await db.prepare('UPDATE expenses SET status=?,updated_at=? WHERE id=?').run('Rejected', now(), e.id);
+  await addHistory(e.id, req.user.id, 'Rejected', reason);
+  await logAudit(req.user, 'Rejected expense', 'expense', e.voucher_no, reason);
+  res.json({ ok: true });
+});
+
+router.post('/expenses/:id/query', requireRole('checker', 'purchase', 'operations', 'accounts', 'admin'), async (req, res) => {
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
+  if (!['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(e.status))
+    return res.status(409).json({ error: `Cannot raise a query while voucher is "${e.status}"` });
+  const to = e.created_by; // queries are always directed to the voucher's creator (the site)
+  const text = (req.body.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Query text required' });
+  const qid = uid();
+  await db.prepare(`INSERT INTO queries (id,expense_id,voucher_no,raised_by,assigned_to,text,status,prev_status,created_at)
+    VALUES (?,?,?,?,?,?,'Open',?,?)`).run(qid, e.id, e.voucher_no, req.user.id, to, text, e.status, now());
+  await db.prepare('INSERT INTO query_messages (id,query_id,by_user,text,at) VALUES (?,?,?,?,?)')
+    .run(uid(), qid, req.user.id, text, now());
+  await db.prepare('UPDATE expenses SET status=?,prev_status=?,updated_at=? WHERE id=?')
+    .run('Query', e.status, now(), e.id);
+  await addHistory(e.id, req.user.id, 'Query raised', text);
+  await logAudit(req.user, 'Raised query', 'expense', e.voucher_no, '');
+  res.json({ ok: true, queryId: qid });
+});
+
+// evidence image (access-checked, not statically exposed)
+router.get('/evidence/:id', async (req, res) => {
+  const ev = await db.prepare('SELECT * FROM evidence WHERE id=?').get(req.params.id);
+  if (!ev) return res.sendStatus(404);
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(ev.expense_id);
+  if (!e || !canSeeExpense(req.user, e)) return res.sendStatus(403);
+  res.sendFile(path.join(UP_DIR, ev.filename));
+});
+
+// ================================================================ QUERIES
+router.post('/queries/:id/reply', async (req, res) => {
+  const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
+  if (!q) return res.status(404).json({ error: 'Not found' });
+  const eR = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
+  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (eR && eR.created_by === req.user.id);
+  if (!allowed) return res.status(403).json({ error: 'Not permitted' });
+  const text = (req.body.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Empty reply' });
+  await db.prepare('INSERT INTO query_messages (id,query_id,by_user,text,at) VALUES (?,?,?,?,?)')
+    .run(uid(), q.id, req.user.id, text, now());
+  res.json({ ok: true });
+});
+router.post('/queries/:id/resolve', async (req, res) => {
+  const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
+  if (!q) return res.status(404).json({ error: 'Not found' });
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
+  const allowed = q.assigned_to === req.user.id || req.user.role === 'admin' || (e && e.created_by === req.user.id);
+  if (!allowed) return res.status(403).json({ error: 'Only the voucher owner or assignee can resolve' });
+  // Delay justification -- an overdue query cannot be resolved without a reason for the delay
+  const qsla = await computeSla(e);
+  const overdue = e.status === 'Query' && qsla && Date.now() > qsla.dueAt;
+  const reason = ((req.body && req.body.reason) || '').trim();
+  if (overdue && !reason) return res.status(409).json({ error: 'Query resolution is overdue — please provide a reason for the delay to proceed.', needReason: true });
+  await db.prepare("UPDATE queries SET status='Resolved',resolved_at=? WHERE id=?").run(now(), q.id);
+  await db.prepare('INSERT INTO query_messages (id,query_id,by_user,text,at) VALUES (?,?,?,?,?)')
+    .run(uid(), q.id, req.user.id, overdue ? ('Marked resolved. Delay reason: ' + reason) : 'Marked resolved.', now());
+  const stillOpen = await db.prepare("SELECT 1 FROM queries WHERE expense_id=? AND status='Open' LIMIT 1").get(q.expense_id);
+  if (!stillOpen && e && e.status === 'Query') {
+    // P12/23 -- full ladder reset: once all queries are resolved, the voucher returns to
+    // the start and the whole chain re-approves (checker -> purchase -> operations ->
+    // accounts), regardless of who raised the query or at which stage. History is retained.
+    const creator = await loadUser(e.created_by);
+    const checkerVoucher = creator && creator.role === 'checker';
+    const resetStatus = checkerVoucher ? 'Checked' : 'Submitted';
+    const resetApprovals = checkerVoucher ? JSON.stringify({ check: { by: e.created_by, at: now() } }) : '{}';
+    await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,submitted_at=?,updated_at=? WHERE id=?")
+      .run(resetStatus, resetApprovals, now(), now(), e.id);
+    await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher ? 'Re-opened — re-approval from Purchase onward' : 'Re-submitted — full re-approval required (checker → purchase → operations → accounts)');
+  }
+  await logAudit(req.user, 'Resolved query', 'expense', q.voucher_no, '');
+  res.json({ ok: true });
+});
+
+// P9/21 -- attach extra photos/PDFs to a voucher while answering a query
+router.post('/queries/:id/attach', upload.array('files', 12), async (req, res) => {
+  const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
+  if (!q) return res.status(404).json({ error: 'Not found' });
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
+  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (e && e.created_by === req.user.id);
+  if (!allowed) return res.status(403).json({ error: 'Not permitted' });
+  const files = req.files || [];
+  if (!files.length) return res.status(400).json({ error: 'No files attached' });
+  for (const f of files) {
+    await db.prepare('INSERT INTO evidence (id,expense_id,filename,original_name,mime) VALUES (?,?,?,?,?)')
+      .run(uid(), q.expense_id, f.filename, f.originalname, f.mimetype);
+  }
+  const names = files.map(f => f.originalname).join(', ');
+  await db.prepare('INSERT INTO query_messages (id,query_id,by_user,text,at) VALUES (?,?,?,?,?)')
+    .run(uid(), q.id, req.user.id, 'Attached: ' + names, now());
+  await addHistory(q.expense_id, req.user.id, 'Attached evidence', names);
+  await logAudit(req.user, 'Attached evidence', 'expense', q.voucher_no, names);
+  res.json({ ok: true, added: files.length });
+});
+
+// ================================================================ FUNDS & BALANCE
+router.get('/funds', async (req, res) => {
+  const m = await nameMaps();
+  const s = scopeOf(req.user);
+  const role = req.user.role;
+  const projFilter = s.all ? (await db.prepare('SELECT id FROM projects WHERE active=1').all()).map(r => r.id) : s.ids;
+  const inq = projFilter.length ? projFilter.map(() => '?').join(',') : "''";
+
+  const fundsRows = await db.prepare(`SELECT * FROM funds WHERE project_id IN (${inq}) ORDER BY created_at DESC`).all(...projFilter);
+
+  // aggregates
+  const injByProj = {}, allocByProj = {}, allocToUser = {}, spentByProj = {}, spentByUser = {};
+  (await db.prepare(`SELECT project_id, SUM(amount) v FROM funds WHERE kind='injection' AND project_id IN (${inq}) GROUP BY project_id`)
+    .all(...projFilter)).forEach(r => injByProj[r.project_id] = toRupees(r.v));
+  (await db.prepare(`SELECT project_id, SUM(amount) v FROM funds WHERE kind='allocation' AND project_id IN (${inq}) GROUP BY project_id`)
+    .all(...projFilter)).forEach(r => allocByProj[r.project_id] = toRupees(r.v));
+  (await db.prepare(`SELECT to_user, SUM(amount) v FROM funds WHERE kind='allocation' AND project_id IN (${inq}) GROUP BY to_user`)
+    .all(...projFilter)).forEach(r => { if (r.to_user) allocToUser[r.to_user] = toRupees(r.v); });
+  (await db.prepare(`SELECT project_id, SUM(amount) v FROM expenses WHERE status!='Rejected' AND project_id IN (${inq}) GROUP BY project_id`)
+    .all(...projFilter)).forEach(r => spentByProj[r.project_id] = toRupees(r.v));
+  (await db.prepare(`SELECT created_by, SUM(amount) v FROM expenses WHERE status!='Rejected' AND project_id IN (${inq}) GROUP BY created_by`)
+    .all(...projFilter)).forEach(r => spentByUser[r.created_by] = toRupees(r.v));
+
+  const sum = o => Object.values(o).reduce((a, b) => a + (b || 0), 0);
+  const decoRows = fundsRows.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: f.to_user ? m.usr[f.to_user] : null }));
+
+  // SITE -- sees only what the checker allocated to it, minus its own spend
+  if (role === 'site') {
+    const received = allocToUser[req.user.id] || 0;
+    const spent = spentByUser[req.user.id] || 0;
+    return res.json({ role, totals: { received, spent, balance: received - spent }, balances: [], funds: [] });
+  }
+
+  // CHECKER -- custodian: received from accounts - distributed to sites - own spend
+  if (role === 'checker') {
+    const received = sum(injByProj), distributed = sum(allocByProj), ownSpent = spentByUser[req.user.id] || 0;
+    const siteAllocations = (await db.prepare(`SELECT to_user, SUM(amount) v FROM funds WHERE kind='allocation' AND project_id IN (${inq}) GROUP BY to_user`)
+      .all(...projFilter)).filter(r => r.to_user)
+      .map(r => { const allocRs = toRupees(r.v); return { userId: r.to_user, userName: m.usr[r.to_user] || '—', allocated: allocRs, spent: spentByUser[r.to_user] || 0, balance: allocRs - (spentByUser[r.to_user] || 0) }; });
+    const balances = projFilter.map(pid => {
+      const p = m.proj[pid] || {}, given = injByProj[pid] || 0, dist = allocByProj[pid] || 0;
+      return { projectId: pid, code: p.code, name: p.name, given, distributed: dist, available: given - dist, balance: given - dist };
+    });
+    return res.json({ role, totals: { received, distributed, spent: ownSpent, balance: received - distributed - ownSpent }, balances, siteAllocations, funds: decoRows });
+  }
+
+  // ACCOUNTS / ADMIN -- project pool: injected - all committed spend
+  const balances = projFilter.map(pid => {
+    const p = m.proj[pid] || {}, given = injByProj[pid] || 0, spent = spentByProj[pid] || 0;
+    return { projectId: pid, code: p.code, name: p.name, given, spent, balance: given - spent };
+  });
+  const totals = balances.reduce((a, b) => ({ received: a.received + b.given, spent: a.spent + b.spent, balance: a.balance + b.balance }), { received: 0, spent: 0, balance: 0 });
+  res.json({ role, totals, balances, funds: decoRows });
+});
+router.post('/funds', requireRole('admin', 'accounts'), async (req, res) => {
+  const { projectId, amount, date, note } = req.body;
+  if (!projectId || !amount || !date) return res.status(400).json({ error: 'Project, amount and date required' });
+  if (!inScope(req.user, projectId)) return res.status(403).json({ error: 'Project not in your access' });
+  await db.prepare("INSERT INTO funds (id,project_id,amount,date,note,added_by,created_at,kind,to_user) VALUES (?,?,?,?,?,?,?,'injection',NULL)")
+    .run(uid(), projectId, toPaise(amount), date, note || null, req.user.id, now());
+  await logAudit(req.user, 'Released funds to project', 'funds', projectId, '₹' + amount);
+  res.json({ ok: true });
+});
+
+// Item 5 -- checker (custodian) allocates a slice of the project pool to a site (internal transfer)
+router.post('/funds/allocate', requireRole('checker', 'admin'), async (req, res) => {
+  const { projectId, toUser, amount, date, note } = req.body;
+  if (!projectId || !toUser || !amount || !date) return res.status(400).json({ error: 'Project, site, amount and date required' });
+  if (!inScope(req.user, projectId)) return res.status(403).json({ error: 'Project not in your access' });
+  const site = await loadUser(toUser);
+  if (!site || site.role !== 'site') return res.status(400).json({ error: 'Recipient must be a site user' });
+  if (!site.all_projects && !(site.project_ids || []).includes(projectId)) return res.status(400).json({ error: 'That site is not assigned to this project' });
+  const injRow = await db.prepare("SELECT COALESCE(SUM(amount),0) v FROM funds WHERE kind='injection' AND project_id=?").get(projectId);
+  const allocRow = await db.prepare("SELECT COALESCE(SUM(amount),0) v FROM funds WHERE kind='allocation' AND project_id=?").get(projectId);
+  const available = injRow.v - allocRow.v; // paise
+  if (toPaise(amount) > available) return res.status(400).json({ error: `Only ${'\u20b9'}${toRupees(available)} is available to distribute in this project` });
+  await db.prepare("INSERT INTO funds (id,project_id,amount,date,note,added_by,created_at,kind,to_user) VALUES (?,?,?,?,?,?,?,'allocation',?)")
+    .run(uid(), projectId, toPaise(amount), date, note || null, req.user.id, now(), toUser);
+  await logAudit(req.user, 'Allocated funds to site', 'funds', projectId, '\u20b9' + amount + ' \u2192 ' + (site.name || toUser));
+  res.json({ ok: true });
+});
+
+// ================================================================ USERS & ACCESS (admin)
+router.get('/users', requireRole('admin'), async (req, res) => {
+  const users = await db.prepare('SELECT id,username,name,role,all_projects,active,created_at FROM users').all();
+  for (const u of users) {
+    u.all_projects = !!u.all_projects; u.active = !!u.active;
+    u.project_ids = (await db.prepare('SELECT project_id FROM user_projects WHERE user_id=?').all(u.id)).map(r => r.project_id);
+  }
+  res.json(users);
+});
+router.post('/users', requireRole('admin'), async (req, res) => {
+  const { username, name, role, password, allProjects, projectIds } = req.body;
+  if (!username || !name || !role || !password) return res.status(400).json({ error: 'Missing fields' });
+  if (await db.prepare('SELECT 1 FROM users WHERE username=?').get(username)) return res.status(409).json({ error: 'Username exists' });
+  const id = uid();
+  await db.prepare('INSERT INTO users (id,username,name,password_hash,role,all_projects,active,created_at) VALUES (?,?,?,?,?,?,1,?)')
+    .run(id, username, name, bcrypt.hashSync(password, 10), role, allProjects ? 1 : 0, now());
+  if (!allProjects) {
+    for (const pid of (projectIds || [])) {
+      await db.prepare('INSERT INTO user_projects (user_id,project_id) VALUES (?,?) ON CONFLICT (user_id,project_id) DO NOTHING').run(id, pid);
+    }
+  }
+  await logAudit(req.user, 'Created user', 'user', username, role);
+  res.json({ id });
+});
+router.patch('/users/:id', requireRole('admin'), async (req, res) => {
+  const u = await db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  const { username, name, role, password, allProjects, projectIds } = req.body;
+  const newUsername = (username || '').trim();
+  if (newUsername && newUsername !== u.username) {
+    const clash = await db.prepare('SELECT 1 FROM users WHERE username=? AND id!=?').get(newUsername, u.id);
+    if (clash) return res.status(409).json({ error: 'Username already exists' });
+  }
+  await db.prepare('UPDATE users SET username=?,name=?,role=?,all_projects=? WHERE id=?')
+    .run(newUsername || u.username, name ?? u.name, role ?? u.role, allProjects ? 1 : 0, u.id);
+  if (password) await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), u.id);
+  await db.prepare('DELETE FROM user_projects WHERE user_id=?').run(u.id);
+  if (!allProjects) {
+    for (const pid of (projectIds || [])) {
+      await db.prepare('INSERT INTO user_projects (user_id,project_id) VALUES (?,?) ON CONFLICT (user_id,project_id) DO NOTHING').run(u.id, pid);
+    }
+  }
+  await logAudit(req.user, 'Edited user', 'user', newUsername || u.username, role || u.role);
+  res.json({ ok: true });
+});
+router.post('/users/:id/toggle', requireRole('admin'), async (req, res) => {
+  const u = await db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  if (u.id === req.user.id) return res.status(400).json({ error: 'Cannot disable yourself' });
+  await db.prepare('UPDATE users SET active=? WHERE id=?').run(u.active ? 0 : 1, u.id);
+  res.json({ ok: true });
+});
+
+// ================================================================ MASTERS (admin)
+const MASTER_TABLES = { categories: 1, projects: 1, locations: 1 };
+router.get('/masters', requireRole('admin'), async (req, res) => {
+  const [categories, projects, locations] = await Promise.all([
+    db.prepare('SELECT * FROM categories ORDER BY name').all(),
+    db.prepare('SELECT * FROM projects ORDER BY code').all(),
+    db.prepare('SELECT * FROM locations ORDER BY name').all(),
+  ]);
+  res.json({ categories, projects, locations });
+});
+router.post('/masters/:type', requireRole('admin'), async (req, res) => {
+  const t = req.params.type;
+  if (!MASTER_TABLES[t]) return res.status(400).json({ error: 'Bad master type' });
+  const name = (req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  if (t === 'projects') {
+    const code = (req.body.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'Code required' });
+    await db.prepare('INSERT INTO projects (id,code,name,active) VALUES (?,?,?,1)').run(uid(), code, name);
+  } else {
+    await db.prepare(`INSERT INTO ${t} (id,name,active) VALUES (?,?,1)`).run(uid(), name);
+  }
+  await logAudit(req.user, 'Added master', 'master', t, name);
+  res.json({ ok: true });
+});
+router.post('/masters/:type/:id/toggle', requireRole('admin'), async (req, res) => {
+  const t = req.params.type;
+  if (!MASTER_TABLES[t]) return res.status(400).json({ error: 'Bad master type' });
+  const row = await db.prepare(`SELECT * FROM ${t} WHERE id=?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  await db.prepare(`UPDATE ${t} SET active=? WHERE id=?`).run(row.active ? 0 : 1, row.id);
+  res.json({ ok: true });
+});
+router.post('/masters/:type/:id/rename', requireRole('admin'), async (req, res) => {
+  const t = req.params.type;
+  if (!MASTER_TABLES[t]) return res.status(400).json({ error: 'Bad master type' });
+  const row = await db.prepare(`SELECT * FROM ${t} WHERE id=?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  const name = (req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  await db.prepare(`UPDATE ${t} SET name=? WHERE id=?`).run(name, row.id);
+  if (t === 'projects') {
+    const code = (req.body.code || '').trim();
+    if (code) await db.prepare('UPDATE projects SET code=? WHERE id=?').run(code, row.id);
+  }
+  await logAudit(req.user, 'Renamed master', 'master', t, `${row.name} → ${name}`);
+  res.json({ ok: true });
+});
+
+// ================================================================ REPORTS (CSV)
+router.get('/reports/expenses.csv', async (req, res) => {
+  const m = await nameMaps();
+  const sc = scopeClause(req.user, 'e');
+  const params = [...sc.params];
+  const f = [];
+  if (req.query.from) { f.push('e.date >= ?'); params.push(req.query.from); }
+  if (req.query.to) { f.push('e.date <= ?'); params.push(req.query.to); }
+  if (req.query.status === '__paid') { f.push('COALESCE(e.paid,0) = 1'); }
+  else if (req.query.status === '__unpaid') { f.push("e.status='Approved' AND COALESCE(e.paid,0) = 0"); }
+  else if (req.query.status) { f.push('e.status = ?'); params.push(req.query.status); }
+  if (req.query.projectId) { f.push('e.project_id = ?'); params.push(req.query.projectId); }
+  const extra = f.length ? ' AND ' + f.join(' AND ') : '';
+  const rows = await db.prepare(`SELECT e.* FROM expenses e WHERE 1=1 ${sc.where} ${extra} ORDER BY e.date ASC`).all(...params);
+  const cols = ['Voucher', 'Date', 'Details', 'Category', 'Project', 'Location', 'Bill', 'Payment', 'Amount', 'Status', 'Paid', 'Paid On', 'Created By'];
+  const esc = v => { v = String(v ?? ''); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  const dcell = ms => { const t = Number(ms); return (ms && !isNaN(t)) ? new Date(t).toISOString().slice(0, 10) : ''; };
+  const lines = [cols.join(',')];
+  rows.forEach(e => {
+    const p = m.proj[e.project_id];
+    lines.push([
+      e.voucher_no, e.date, e.details, m.cat[e.category_id] || '', p ? p.code : '',
+      m.loc[e.location_id] || '', e.bill_received || '', e.payment_status || '',
+      toRupees(e.amount), e.status, e.paid ? 'Yes' : 'No', dcell(e.paid_at),
+      m.usr[e.created_by] || '',
+    ].map(esc).join(','));
+  });
+  await logAudit(req.user, 'Exported CSV', 'report', '', rows.length + ' rows');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="site-expenses-${Date.now()}.csv"`);
+  res.send('\ufeff' + lines.join('\n'));
+});
+
+//===============================================================================================================================
+// Download one approved, unpaid payment with its payment data and attachments.
+router.get('/payments/:id/download', requireRole('accounts', 'admin'), async (req, res) => {
+  const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
+
+  if (!e) return res.status(404).json({ error: 'Payment not found' });
+
+  if (
+    e.status !== 'Approved' ||
+    e.paid ||
+    !canSeeExpense(req.user, e)
+  ) {
+    return res.status(403).json({ error: 'Payment is not available for download' });
+  }
+
+  const m = await nameMaps();
+  const p = m.proj[e.project_id];
+
+  const expense = {
+    ...e,
+    categoryName: m.cat[e.category_id] || '',
+    locationName: m.loc[e.location_id] || '',
+    createdByName: m.usr[e.created_by] || '',
+    project: p || null,
+  };
+
+  await buildPaymentZip(res, [expense]);
+});
+
+
+// Download selected approved, unpaid payments with their payment data and attachments.
+router.post('/payments/download', requireRole('accounts', 'admin'), async (req, res) => {
+  const ids = Array.isArray(req.body.ids)
+    ? [...new Set(req.body.ids.map(String).filter(Boolean))]
+    : [];
+
+  if (!ids.length) {
+    return res.status(400).json({ error: 'No vouchers selected' });
+  }
+
+  const m = await nameMaps();
+  const expenses = [];
+
+  for (const id of ids) {
+    const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(id);
+
+    if (!e) {
+      return res.status(404).json({ error: 'One or more selected payments were not found' });
+    }
+
+    if (e.status !== 'Approved' || e.paid || !canSeeExpense(req.user, e)) {
+      return res.status(403).json({
+        error: `Payment ${e.voucher_no} is not available for download`
+      });
+    }
+
+    const p = m.proj[e.project_id];
+
+    expenses.push({
+      ...e,
+      categoryName: m.cat[e.category_id] || '',
+      locationName: m.loc[e.location_id] || '',
+      createdByName: m.usr[e.created_by] || '',
+      project: p || null,
+    });
+  }
+
+  await buildPaymentZip(res, expenses);
+});
+
+// ================================================================ PAYMENTS
+// P31 -- Accounts confirms payment on approved vouchers; paid ones leave the Approved Payments tab
+router.post('/payments', requireRole('accounts', 'admin'), async (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+  if (!ids.length) return res.status(400).json({ error: 'No vouchers selected' });
+  let paid = 0;
+  for (const id of ids) {
+    const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(id);
+    if (!e || e.status !== 'Approved' || e.paid || !canSeeExpense(req.user, e)) continue;
+    await db.prepare("UPDATE expenses SET paid=1,paid_at=?,paid_by=? WHERE id=? AND status='Approved' AND COALESCE(paid,0)=0")
+      .run(now(), req.user.id, id);
+    await addHistory(id, req.user.id, 'Payment confirmed', 'Marked as paid');
+    await logAudit(req.user, 'Confirmed payment', 'expense', e.voucher_no, '₹' + toRupees(e.amount));
+    paid++;
+  }
+  res.json({ ok: true, paid });
+});
+
+// ================================================================ BUDGETS (#9 -- accounts/admin)
+router.get('/budgets', requireRole('accounts', 'admin'), async (req, res) => {
+  const m = await nameMaps();
+  const period = req.query.period || null;
+  const rows = period
+    ? await db.prepare('SELECT * FROM project_budgets WHERE period=? ORDER BY project_id').all(period)
+    : await db.prepare('SELECT * FROM project_budgets ORDER BY period DESC, project_id').all();
+  res.json(rows.map(b => ({
+    id: b.id, projectId: b.project_id, code: (m.proj[b.project_id] || {}).code || '—',
+    name: (m.proj[b.project_id] || {}).name || '', period: b.period, budget: toRupees(b.budget_amount),
+  })));
+});
+router.post('/budgets', requireRole('accounts', 'admin'), async (req, res) => {
+  const { projectId, period, amount } = req.body;
+  if (!projectId || !period || amount == null) return res.status(400).json({ error: 'Project, period and amount required' });
+  if (!/^\d{4}-\d{2}$/.test(period)) return res.status(400).json({ error: 'Period must be YYYY-MM' });
+  const existing = await db.prepare('SELECT id FROM project_budgets WHERE project_id=? AND period=?').get(projectId, period);
+  if (existing) {
+    await db.prepare('UPDATE project_budgets SET budget_amount=?,updated_at=? WHERE id=?').run(toPaise(amount), now(), existing.id);
+  } else {
+    await db.prepare('INSERT INTO project_budgets (id,project_id,period,budget_amount,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+      .run(uid(), projectId, period, toPaise(amount), req.user.id, now(), now());
+  }
+  await logAudit(req.user, 'Set project budget', 'budget', projectId, `${period}: ₹${amount}`);
+  res.json({ ok: true });
+});
+router.delete('/budgets/:id', requireRole('accounts', 'admin'), async (req, res) => {
+  const b = await db.prepare('SELECT * FROM project_budgets WHERE id=?').get(req.params.id);
+  if (!b) return res.status(404).json({ error: 'Not found' });
+  await db.prepare('DELETE FROM project_budgets WHERE id=?').run(req.params.id);
+  await logAudit(req.user, 'Removed project budget', 'budget', b.project_id, b.period);
+  res.json({ ok: true });
+});
+
+router.get('/analytics', requireRole('accounts', 'admin'), async (req, res) => {
+  const m = await nameMaps();
+  const SPEND = "status NOT IN ('Draft','Rejected')";
+  const byCategory = (await db.prepare(`SELECT category_id, SUM(amount) v, COUNT(*) c FROM expenses WHERE ${SPEND} GROUP BY category_id ORDER BY v DESC`)
+    .all()).map(r => ({ name: m.cat[r.category_id] || 'Uncategorised', amount: toRupees(r.v), count: r.c }));
+  const byProject = (await db.prepare(`SELECT project_id, SUM(amount) v, COUNT(*) c FROM expenses WHERE ${SPEND} GROUP BY project_id ORDER BY v DESC`)
+    .all()).map(r => ({ code: (m.proj[r.project_id] || {}).code || '—', name: (m.proj[r.project_id] || {}).name || '', amount: toRupees(r.v), count: r.c }));
+  const byStatus = (await db.prepare('SELECT status, SUM(amount) v, COUNT(*) c FROM expenses GROUP BY status').all())
+    .map(r => ({ status: r.status, amount: toRupees(r.v), count: r.c }));
+  const st = s => { const r = byStatus.find(x => x.status === s); return r ? r.amount : 0; };
+  const totalRow = await db.prepare(`SELECT COALESCE(SUM(amount),0) v FROM expenses WHERE ${SPEND}`).get();
+  const total = toRupees(totalRow.v);
+  const approved = st('Approved');
+  const paidRow = await db.prepare('SELECT COALESCE(SUM(amount),0) v FROM expenses WHERE paid=1').get();
+  const paid = toRupees(paidRow.v);
+  const totals = { total, approved, paid, pending: total - approved, rejected: st('Rejected') };
+  const byMonth = (await db.prepare(`SELECT substr(date,1,7) ym, SUM(amount) v FROM expenses WHERE ${SPEND} AND date IS NOT NULL GROUP BY ym ORDER BY ym DESC LIMIT 6`)
+    .all()).reverse().map(r => ({ month: r.ym, amount: toRupees(r.v) }));
+
+  // ---- money health ----
+  const users = {}; (await db.prepare('SELECT id,name,role FROM users').all()).forEach(u => users[u.id] = u);
+  const spentByUser = {}; (await db.prepare(`SELECT created_by, SUM(amount) v FROM expenses WHERE ${SPEND} GROUP BY created_by`).all()).forEach(r => spentByUser[r.created_by] = toRupees(r.v));
+  const releasedRow = await db.prepare("SELECT COALESCE(SUM(amount),0) v FROM funds WHERE kind='injection'").get();
+  const released = toRupees(releasedRow.v);
+  const allocationBySite = (await db.prepare("SELECT to_user, SUM(amount) v FROM funds WHERE kind='allocation' GROUP BY to_user").all())
+    .filter(r => r.to_user).map(r => { const allocRs = toRupees(r.v), sp = spentByUser[r.to_user] || 0; return { name: (users[r.to_user] || {}).name || '—', allocated: allocRs, spent: sp, balance: allocRs - sp }; })
+    .sort((a, b) => b.allocated - a.allocated);
+  const monthsActive = Math.max(1, byMonth.length);
+  const avgMonthlyBurn = total / monthsActive;
+  const burn = { released, spent: total, remaining: released - total, avgMonthlyBurn, runwayMonths: avgMonthlyBurn > 0 ? (released - total) / avgMonthlyBurn : null };
+  const unpaidRows = (await db.prepare("SELECT project_id, SUM(amount) v FROM expenses WHERE status='Approved' AND COALESCE(paid,0)=0 GROUP BY project_id ORDER BY v DESC").all())
+    .map(r => ({ ...r, v: toRupees(r.v) }));
+  const unpaidByProject = unpaidRows.map(r => ({ code: (m.proj[r.project_id] || {}).code || '—', name: (m.proj[r.project_id] || {}).name || '', amount: r.v }));
+  const unpaidTotal = unpaidRows.reduce((a, b) => a + b.v, 0);
+
+  // ---- budget vs actual, current month (#9) ----
+  const curMonth = new Date().toISOString().slice(0, 7);
+  const spendThisMonth = {};
+  (await db.prepare(`SELECT project_id, SUM(amount) v FROM expenses WHERE ${SPEND} AND substr(date,1,7)=? GROUP BY project_id`).all(curMonth))
+    .forEach(r => spendThisMonth[r.project_id] = toRupees(r.v));
+  const budgetVsActual = (await db.prepare('SELECT project_id, budget_amount FROM project_budgets WHERE period=?').all(curMonth))
+    .map(b => {
+      const p = m.proj[b.project_id] || {}, budgetRs = toRupees(b.budget_amount), incurred = spendThisMonth[b.project_id] || 0;
+      return { code: p.code || '—', name: p.name || '', period: curMonth, budget: budgetRs, incurred, variance: budgetRs - incurred, pctUsed: budgetRs > 0 ? +(incurred / budgetRs * 100).toFixed(1) : null };
+    });
+
+  // ---- workflow speed (iterate vouchers once) ----
+  const rows = await db.prepare('SELECT id,status,amount,created_by,submitted_at,created_at,approvals,date FROM expenses').all();
+  const DAY = 86400000;
+  const acc = { check: { t: 0, n: 0 }, purchase: { t: 0, n: 0 }, operations: { t: 0, n: 0 }, accounts: { t: 0, n: 0 }, approved: { t: 0, n: 0 } };
+  const cleared = {};
+  rows.forEach(e => {
+    let ap = {}; try { ap = JSON.parse(e.approvals || '{}'); } catch (x) {}
+    const anchor = e.submitted_at || e.created_at, at = k => ap[k] && ap[k].at;
+    if (at('check') && anchor) { acc.check.t += at('check') - anchor; acc.check.n++; }
+    if (at('purchase') && at('check')) { acc.purchase.t += at('purchase') - at('check'); acc.purchase.n++; }
+    if (at('operations') && at('purchase')) { acc.operations.t += at('operations') - at('purchase'); acc.operations.n++; }
+    if (at('accounts') && at('operations')) { acc.accounts.t += at('accounts') - at('operations'); acc.accounts.n++; }
+    if (at('approved') && at('accounts')) { acc.approved.t += at('approved') - at('accounts'); acc.approved.n++; }
+    ['check', 'purchase', 'operations', 'accounts', 'approved'].forEach(k => { if (ap[k] && ap[k].by) cleared[ap[k].by] = (cleared[ap[k].by] || 0) + 1; });
+  });
+  const stageLabel = { check: 'Submit → Checked', purchase: 'Checked → Purchase', operations: 'Purchase → Operations', accounts: 'Operations → Accounts', approved: 'Accounts → Approved' };
+  const turnaround = ['check', 'purchase', 'operations', 'accounts', 'approved'].map(k => ({ stage: stageLabel[k], avgDays: acc[k].n ? +(acc[k].t / acc[k].n / DAY).toFixed(1) : 0, count: acc[k].n }));
+  const throughput = Object.entries(cleared).map(([id, c]) => ({ name: (users[id] || {}).name || '—', role: (users[id] || {}).role || '', cleared: c })).sort((a, b) => b.cleared - a.cleared);
+
+  // ---- SLA + aging (pending vouchers) ----
+  const pendingStatuses = ['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed', 'Query'];
+  let onTrack = 0, overdue = 0; const aging = { '< 2 days': 0, '2–7 days': 0, '> 7 days': 0 };
+  for (const e of rows.filter(e => pendingStatuses.includes(e.status))) {
+    const sla = await computeSla(e);
+    if (sla && Date.now() > sla.dueAt) overdue++; else onTrack++;
+    const ageD = (Date.now() - (e.submitted_at || e.created_at || Date.now())) / DAY;
+    if (ageD < 2) aging['< 2 days']++; else if (ageD <= 7) aging['2–7 days']++; else aging['> 7 days']++;
+  }
+  const agingArr = Object.entries(aging).map(([bucket, count]) => ({ bucket, count }));
+
+  res.json({ byCategory, byProject, byStatus, totals, byMonth, allocationBySite, burn, unpaidByProject, unpaidTotal, budgetVsActual, turnaround, throughput, sla: { onTrack, overdue }, aging: agingArr });
+});
+
+// P30 -- Audit Trail is admin-only (Accounts no longer has access)
+router.get('/audit', requireRole('admin'), async (req, res) => {
+  res.json(await db.prepare('SELECT * FROM audit ORDER BY at DESC LIMIT 500').all());
+});
+
+module.exports = router;
