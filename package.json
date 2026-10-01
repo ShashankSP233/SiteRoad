@@ -1,7 +1,7 @@
 {
-  "name": "sitexpense-node",
+  "name": "siteroad-v2",
   "version": "2.0.0",
-  "description": "Site Expense Management — Node.js + PostgreSQL. Multi-location entry, sequential review, project & profile access, funds & balance.",
+  "description": "SiteRoad — site expense management with role-based review and confirmed fund receipts.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

@@ -8,6 +8,10 @@ const {ZipArchive} = require('archiver');
 const { db, uid, now, loadUser, scopeOf, nextVoucher, nextFundRequest, logAudit, addHistory, toPaise, toRupees } = require('./db');
 
 const router = express.Router();
+const USER_ROLES = new Set([
+  'admin', 'site_accounts', 'general_manager', 'project_director',
+  'senior_accountant', 'accounts_manager', 'account_checker',
+]);
 const UP_DIR = path.join(__dirname, '..', 'uploads');
 if (!fs.existsSync(UP_DIR)) fs.mkdirSync(UP_DIR, { recursive: true });
 
@@ -50,16 +54,16 @@ function scopeClause(user, alias = 'e') {
       params.push(...s.ids);
     }
   }
-  if (user.role === 'site') {
-    clauses.push(`${alias}.created_by = ?`);
-    params.push(user.id);
+  if (user.role === 'site_accounts') {
+    clauses.push(`(${alias}.created_by = ? OR ${alias}.site_user_id = ?)`);
+    params.push(user.id, user.id);
   }
   return { where: clauses.length ? ' AND ' + clauses.join(' AND ') : '', params };
 }
 function canSeeExpense(user, exp) {
   const s = scopeOf(user);
   if (!s.all && !s.ids.includes(exp.project_id)) return false;
-  if (user.role === 'site' && exp.created_by !== user.id) return false;
+  if (user.role === 'site_accounts' && exp.created_by !== user.id && exp.site_user_id !== user.id) return false;
   return true;
 }
 function inScope(user, projectId) {
@@ -287,6 +291,7 @@ async function decorate(e, m) {
     projectName: p ? `${p.code} · ${p.name}` : '—',
     locationName: m.loc[e.location_id] || '—',
     createdByName: m.usr[e.created_by] || '—',
+    siteUserName: m.usr[e.site_user_id || e.created_by] || '—',
     evidenceCount: evCount.c,
     sla,
     overallSla,
@@ -404,14 +409,19 @@ router.get('/expenses/:id', async (req, res) => {
   res.json({ ...(await decorate(e, m)), evidence, history, queries });
 });
 
-router.post('/expenses', upload.array('photos', 12), requireRole('site', 'checker', 'admin'), async (req, res) => {
+router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts', 'general_manager', 'admin'), async (req, res) => {
   const b = req.body;
   if (!b.date || !b.amount || !b.details) return res.status(400).json({ error: 'Date, amount and details required' });
   if (!inScope(req.user, b.projectId)) return res.status(403).json({ error: 'Project not in your access' });
+  const siteUserId = req.user.role === 'site_accounts' ? req.user.id : String(b.siteUserId || '').trim();
+  if (!siteUserId) return res.status(400).json({ error: 'Select the Site Accounts user responsible for this expense' });
+  const siteUser = await loadUser(siteUserId);
+  if (!siteUser || siteUser.role !== 'site_accounts' || !siteUser.active) return res.status(400).json({ error: 'Expense owner must be an active Site Accounts user' });
+  if (!siteUser.all_projects && !(siteUser.project_ids || []).includes(b.projectId)) return res.status(400).json({ error: 'The selected Site Accounts user is not assigned to this project' });
   const asDraft = b.asDraft === 'true' || b.asDraft === true;
 
   // P14 -- site/checker cannot enter expenses dated more than 7 days ago
-  if (['site', 'checker'].includes(req.user.role)) {
+  if (['site_accounts', 'general_manager'].includes(req.user.role)) {
     const dErr = entryDateError(b.date);
     if (dErr) return res.status(400).json({ error: dErr });
   }
@@ -428,9 +438,9 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site', 'checke
 
   const id = uid();
   const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId || null);
-  // A checker enters expenses directly and is their own checker, so the voucher starts
+  // A General Manager enters expenses directly and is their own checker, so the voucher starts
   // already "Checked" (workflow begins at Purchase). Everyone else starts at "Submitted".
-  const checkerEntry = req.user.role === 'checker';
+  const checkerEntry = req.user.role === 'general_manager';
   const status = asDraft ? 'Draft' : (checkerEntry ? 'Checked' : 'Submitted');
   const approvals = (!asDraft && checkerEntry) ? JSON.stringify({ check: { by: req.user.id, at: now() } }) : '{}';
   // voucher + evidence + history + audit succeed or roll back together
@@ -440,11 +450,11 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site', 'checke
     voucher = await nextVoucher();
 
     await db.prepare(`INSERT INTO expenses
-      (id,voucher_no,date,amount,category_id,details,project_id,location_id,expense_done_by,
+      (id,voucher_no,date,amount,category_id,details,project_id,location_id,site_user_id,expense_done_by,
       bill_received,bill_no,payment_status,remark,status,approvals,created_by,created_at,updated_at,submitted_at,paid)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, voucher, b.date, toPaise(b.amount), b.categoryId || null, b.details, b.projectId,
-      locationId, b.expenseDoneBy || req.user.name, b.billReceived || 'No',
+      locationId, siteUserId, b.expenseDoneBy || req.user.name, b.billReceived || 'No',
       b.billNo || null, 'Pending', b.remark || null, status, approvals,
       req.user.id, now(), now(), asDraft ? null : now(),
       b.paid === '1' ? 1 : 0
@@ -465,13 +475,13 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site', 'checke
 router.patch('/expenses/:id', async (req, res) => {
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
-  const isOwnerEditable = req.user.role === 'site' && e.created_by === req.user.id &&
+  const isOwnerEditable = req.user.role === 'site_accounts' && (e.created_by === req.user.id || e.site_user_id === req.user.id) &&
     ['Draft', 'Submitted', 'Query'].includes(e.status);
   if (!(isOwnerEditable || req.user.role === 'admin')) return res.status(403).json({ error: 'Not editable' });
   const b = req.body;
   const willSubmit = !b.asDraft;
   // P14 -- keep the 7-day rule on edits too (site only)
-  if (req.user.role === 'site' && b.date) {
+  if (req.user.role === 'site_accounts' && b.date) {
     const dErr = entryDateError(b.date);
     if (dErr) return res.status(400).json({ error: dErr });
   }
@@ -494,11 +504,11 @@ router.patch('/expenses/:id', async (req, res) => {
 
 // ---- sequential review ladder (server-enforced order) ----
 const FLOW = {
-  check:      { from: 'Submitted',           to: 'Checked',             role: 'checker',    key: 'check',      label: 'Checked' },
-  purchase:   { from: 'Checked',             to: 'Purchase Reviewed',   role: 'purchase',   key: 'purchase',   label: 'Reviewed by Purchase' },
-  operations: { from: 'Purchase Reviewed',   to: 'Operations Reviewed', role: 'operations', key: 'operations', label: 'Reviewed by Operations' },
-  accounts:   { from: 'Operations Reviewed', to: 'Accounts Reviewed',   roles: ['accounts', 'account_checker'], key: 'accounts', label: 'Reviewed by Accounts' },
-  approve:    { from: 'Accounts Reviewed',   to: 'Approved',            role: 'accounts',   key: 'approved',   label: 'Approved' },
+  check:      { from: 'Submitted',           to: 'Checked',             role: 'general_manager',    key: 'check',      label: 'Checked by General Manager' },
+  purchase:   { from: 'Checked',             to: 'Purchase Reviewed',   role: 'project_director',   key: 'purchase',   label: 'Reviewed by Project Director / Incharge' },
+  operations: { from: 'Purchase Reviewed',   to: 'Operations Reviewed', role: 'senior_accountant', key: 'operations', label: 'Reviewed by Senior Accountant' },
+  accounts:   { from: 'Operations Reviewed', to: 'Accounts Reviewed',   roles: ['accounts_manager', 'account_checker'], key: 'accounts', label: 'Reviewed by Accounts Manager / Head' },
+  approve:    { from: 'Accounts Reviewed',   to: 'Approved',            role: 'accounts_manager',   key: 'approved',   label: 'Approved' },
 };
 router.post('/expenses/:id/advance/:step', async (req, res) => {
   const step = FLOW[req.params.step];
@@ -532,7 +542,7 @@ router.post('/expenses/:id/advance/:step', async (req, res) => {
   res.json({ ok: true, status: step.to });
 });
 
-router.post('/expenses/:id/reject', requireRole('checker', 'purchase', 'operations', 'accounts', 'account_checker', 'admin'), async (req, res) => {
+router.post('/expenses/:id/reject', requireRole('general_manager', 'project_director', 'senior_accountant', 'accounts_manager', 'account_checker', 'admin'), async (req, res) => {
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
   if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
@@ -546,13 +556,13 @@ router.post('/expenses/:id/reject', requireRole('checker', 'purchase', 'operatio
   res.json({ ok: true });
 });
 
-router.post('/expenses/:id/query', requireRole('checker', 'purchase', 'operations', 'accounts', 'account_checker', 'admin'), async (req, res) => {
+router.post('/expenses/:id/query', requireRole('general_manager', 'project_director', 'senior_accountant', 'accounts_manager', 'account_checker', 'admin'), async (req, res) => {
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
   if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
   if (!['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(e.status))
     return res.status(409).json({ error: `Cannot raise a query while voucher is "${e.status}"` });
-  const to = e.created_by; // queries are always directed to the voucher's creator (the site)
+  const to = e.site_user_id || e.created_by; // query the Site Accounts owner when a manager entered the voucher
   const text = (req.body.text || '').trim();
   if (!text) return res.status(400).json({ error: 'Query text required' });
   const qid = uid();
@@ -581,7 +591,7 @@ router.post('/queries/:id/reply', async (req, res) => {
   const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
   if (!q) return res.status(404).json({ error: 'Not found' });
   const eR = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
-  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (eR && eR.created_by === req.user.id);
+  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (eR && (eR.created_by === req.user.id || eR.site_user_id === req.user.id));
   if (!allowed) return res.status(403).json({ error: 'Not permitted' });
   const text = (req.body.text || '').trim();
   if (!text) return res.status(400).json({ error: 'Empty reply' });
@@ -593,7 +603,7 @@ router.post('/queries/:id/resolve', async (req, res) => {
   const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
   if (!q) return res.status(404).json({ error: 'Not found' });
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
-  const allowed = q.assigned_to === req.user.id || req.user.role === 'admin' || (e && e.created_by === req.user.id);
+  const allowed = q.assigned_to === req.user.id || req.user.role === 'admin' || (e && (e.created_by === req.user.id || e.site_user_id === req.user.id));
   if (!allowed) return res.status(403).json({ error: 'Only the voucher owner or assignee can resolve' });
   // Delay justification -- an overdue query cannot be resolved without a reason for the delay
   const qsla = await computeSla(e);
@@ -609,12 +619,12 @@ router.post('/queries/:id/resolve', async (req, res) => {
     // the start and the whole chain re-approves (checker -> purchase -> operations ->
     // accounts), regardless of who raised the query or at which stage. History is retained.
     const creator = await loadUser(e.created_by);
-    const checkerVoucher = creator && creator.role === 'checker';
+    const checkerVoucher = creator && creator.role === 'general_manager';
     const resetStatus = checkerVoucher ? 'Checked' : 'Submitted';
     const resetApprovals = checkerVoucher ? JSON.stringify({ check: { by: e.created_by, at: now() } }) : '{}';
     await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,submitted_at=?,updated_at=? WHERE id=?")
       .run(resetStatus, resetApprovals, now(), now(), e.id);
-    await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher ? 'Re-opened — re-approval from Purchase onward' : 'Re-submitted — full re-approval required (checker → purchase → operations → accounts)');
+    await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher ? 'Re-opened — re-approval from Project Director / Incharge onward' : 'Re-submitted — full re-approval required (General Manager → Project Director / Incharge → Senior Accountant → Accounts Manager / Head)');
   }
   await logAudit(req.user, 'Resolved query', 'expense', q.voucher_no, '');
   res.json({ ok: true });
@@ -625,7 +635,7 @@ router.post('/queries/:id/attach', upload.array('files', 12), async (req, res) =
   const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
   if (!q) return res.status(404).json({ error: 'Not found' });
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
-  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (e && e.created_by === req.user.id);
+  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (e && (e.created_by === req.user.id || e.site_user_id === req.user.id));
   if (!allowed) return res.status(403).json({ error: 'Not permitted' });
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: 'No files attached' });
@@ -643,241 +653,48 @@ router.post('/queries/:id/attach', upload.array('files', 12), async (req, res) =
 
 // ================================================================ FUNDS & BALANCE
 router.get('/funds', async (req, res) => {
-  if (!['site', 'checker', 'accounts', 'admin'].includes(req.user.role)) {
+  const visibleRoles = ['site_accounts', 'general_manager', 'senior_accountant', 'accounts_manager', 'admin'];
+  if (!visibleRoles.includes(req.user.role)) {
     return res.status(403).json({ error: 'Not permitted' });
   }
   const m = await nameMaps();
   const s = scopeOf(req.user);
   const role = req.user.role;
   let projFilter = s.all ? (await db.prepare('SELECT id FROM projects WHERE active=1').all()).map(r => r.id) : s.ids;
-  if (!['accounts', 'admin'].includes(role)) {
-    const adminFundProject = await db.prepare(`
-      SELECT id
-      FROM projects
-      WHERE code = 'ADMIN-FUND'
-      LIMIT 1
-    `).get();
-    if (adminFundProject) {
-      projFilter = projFilter.filter(projectId => projectId !== adminFundProject.id);
-    }
-  }
   const inq = projFilter.length ? projFilter.map(() => '?').join(',') : "''";
+  const spendRows = await db.prepare(`
+    SELECT COALESCE(site_user_id,created_by) site_user_id, COALESCE(SUM(amount),0) spent
+    FROM expenses
+    WHERE status NOT IN ('Rejected','Draft') AND project_id IN (${inq})
+    GROUP BY COALESCE(site_user_id,created_by)
+  `).all(...projFilter);
+  const spentByUser = Object.fromEntries(spendRows.map(r => [r.site_user_id, toRupees(r.spent)]));
 
-  const fundsRows = await db.prepare(`SELECT * FROM funds WHERE project_id IN (${inq}) ORDER BY created_at DESC`).all(...projFilter);
-
-  // aggregates
-  const injByProj = {}, allocByProj = {}, allocToUser = {}, spentByProj = {}, spentByUser = {};
-  (await db.prepare(`SELECT project_id, SUM(amount) v FROM funds WHERE kind='injection' AND project_id IN (${inq}) GROUP BY project_id`)
-    .all(...projFilter)).forEach(r => injByProj[r.project_id] = toRupees(r.v));
-  (await db.prepare(`SELECT project_id, SUM(amount) v FROM funds WHERE kind='allocation' AND project_id IN (${inq}) GROUP BY project_id`)
-    .all(...projFilter)).forEach(r => allocByProj[r.project_id] = toRupees(r.v));
-  (await db.prepare(`SELECT to_user, SUM(amount) v FROM funds WHERE kind='allocation' AND project_id IN (${inq}) GROUP BY to_user`)
-    .all(...projFilter)).forEach(r => { if (r.to_user) allocToUser[r.to_user] = toRupees(r.v); });
-  (await db.prepare(`SELECT project_id, SUM(amount) v FROM expenses WHERE status!='Rejected' AND project_id IN (${inq}) GROUP BY project_id`)
-    .all(...projFilter)).forEach(r => spentByProj[r.project_id] = toRupees(r.v));
-  (await db.prepare(`SELECT created_by, SUM(amount) v FROM expenses WHERE status!='Rejected' AND project_id IN (${inq}) GROUP BY created_by`)
-    .all(...projFilter)).forEach(r => spentByUser[r.created_by] = toRupees(r.v));
-
-  const sum = o => Object.values(o).reduce((a, b) => a + (b || 0), 0);
-  const decoRows = fundsRows.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: f.to_user ? m.usr[f.to_user] : null }));
-
-  // SITE -- sees only what the checker allocated to it, minus its own spend
-  if (role === 'site') {
-    const received = allocToUser[req.user.id] || 0;
+  if (role === 'site_accounts') {
+    const [receivedRow, movementRows] = await Promise.all([
+      db.prepare("SELECT COALESCE(SUM(amount),0) amount FROM funds WHERE kind='allocation' AND to_user=?").get(req.user.id),
+      db.prepare("SELECT * FROM funds WHERE kind='allocation' AND to_user=? ORDER BY created_at DESC").all(req.user.id),
+    ]);
+    const received = toRupees(receivedRow.amount);
     const spent = spentByUser[req.user.id] || 0;
-    return res.json({ role, totals: { received, spent, balance: received - spent }, balances: [], funds: [] });
+    return res.json({ role, totals: { received, spent, balance: received - spent }, siteBalances: [], funds: movementRows.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: req.user.name })) });
   }
 
-  // CHECKER -- custodian: received from accounts - distributed to sites - own spend
-  if (role === 'checker') {
-    const received = sum(injByProj), distributed = sum(allocByProj), ownSpent = spentByUser[req.user.id] || 0;
-    const siteAllocations = (await db.prepare(`SELECT to_user, SUM(amount) v FROM funds WHERE kind='allocation' AND project_id IN (${inq}) GROUP BY to_user`)
-      .all(...projFilter)).filter(r => r.to_user)
-      .map(r => { const allocRs = toRupees(r.v); return { userId: r.to_user, userName: m.usr[r.to_user] || '—', allocated: allocRs, spent: spentByUser[r.to_user] || 0, balance: allocRs - (spentByUser[r.to_user] || 0) }; });
-    const balances = projFilter.map(pid => {
-      const p = m.proj[pid] || {}, given = injByProj[pid] || 0, dist = allocByProj[pid] || 0;
-      return { projectId: pid, code: p.code, name: p.name, given, distributed: dist, available: given - dist, balance: given - dist };
-    });
-    return res.json({ role, totals: { received, distributed, spent: ownSpent, balance: received - distributed - ownSpent }, balances, siteAllocations, funds: decoRows });
-  }
-
-  // ACCOUNTS / ADMIN -- project pool: injected - all committed spend
-  const balances = projFilter.map(pid => {
-    const p = m.proj[pid] || {}, given = injByProj[pid] || 0, spent = spentByProj[pid] || 0;
-    return { projectId: pid, code: p.code, name: p.name, given, spent, balance: given - spent };
+  const users = await db.prepare("SELECT id,name FROM users WHERE role='site_accounts' AND active=1 ORDER BY name").all();
+  const allocations = await db.prepare(`
+    SELECT f.to_user, COALESCE(SUM(f.amount),0) amount
+    FROM funds f JOIN projects p ON p.id=f.project_id
+    WHERE f.kind='allocation' AND f.to_user IS NOT NULL AND f.project_id IN (${inq})
+    GROUP BY f.to_user
+  `).all(...projFilter);
+  const allocatedByUser = Object.fromEntries(allocations.map(r => [r.to_user, toRupees(r.amount)]));
+  const siteBalances = users.map(u => {
+    const received = allocatedByUser[u.id] || 0;
+    const spent = spentByUser[u.id] || 0;
+    return { userId: u.id, userName: u.name, received, spent, balance: received - spent };
   });
-  const projectBalances = balances.filter(b => b.code !== 'ADMIN-FUND');
-  const totals = projectBalances.reduce((a, b) => ({ received: a.received + b.given, spent: a.spent + b.spent, balance: a.balance + b.balance }), { received: 0, spent: 0, balance: 0 });
-    // ADMIN FUND -- separate wallet balance
-  let adminFund = null;
-
-  const adminFundProject = await db.prepare(`
-    SELECT id
-    FROM projects
-    WHERE code = 'ADMIN-FUND'
-    LIMIT 1
-  `).get();
-
-  if (adminFundProject) {
-    const receivedRow = await db.prepare(`
-      SELECT COALESCE(SUM(amount), 0) v
-      FROM funds
-      WHERE project_id = ?
-        AND kind = 'injection'
-    `).get(adminFundProject.id);
-
-    const releasedRow = await db.prepare(`
-      SELECT COALESCE(SUM(amount), 0) v
-      FROM funds
-      WHERE project_id = ?
-        AND kind = 'allocation'
-    `).get(adminFundProject.id);
-
-    adminFund = {
-      projectId: adminFundProject.id,
-      received: toRupees(receivedRow.v),
-      released: toRupees(releasedRow.v),
-      balance:
-        toRupees(receivedRow.v) -
-        toRupees(releasedRow.v)
-    };
-  }
-  res.json({
-    role,
-    totals,
-    balances,
-    funds: decoRows,
-    adminFund
-  });
-});
-
-
-router.post('/funds', requireRole('admin'), async (req, res) => {
-  const { projectId, amount, date, note } = req.body;
-
-  if (!projectId || !amount || !date) {
-    return res.status(400).json({
-      error: 'Project, amount and date required'
-    });
-  }
-
-  if (!inScope(req.user, projectId)) {
-    return res.status(403).json({
-      error: 'Project not in your access'
-    });
-  }
-
-  const amountPaise = toPaise(amount);
-
-  if (amountPaise <= 0) {
-    return res.status(400).json({
-      error: 'Amount must be greater than zero'
-    });
-  }
-
-  await db.transaction(async () => {
-    // ADMIN-FUND is the Admin wallet.
-    const adminFund = await db.prepare(`
-      SELECT id
-      FROM projects
-      WHERE code = 'ADMIN-FUND'
-      LIMIT 1
-    `).get();
-
-    if (!adminFund) {
-      throw new Error('ADMIN-FUND project is missing');
-    }
-
-    // Never allow ADMIN-FUND itself as a transfer destination.
-    if (projectId === adminFund.id) {
-      throw new Error('Cannot release funds to ADMIN-FUND');
-    }
-
-    // Check current Admin wallet balance.
-    const receivedRow = await db.prepare(`
-      SELECT COALESCE(SUM(amount), 0) v
-      FROM funds
-      WHERE project_id = ?
-        AND kind = 'injection'
-    `).get(adminFund.id);
-
-    const releasedRow = await db.prepare(`
-      SELECT COALESCE(SUM(amount), 0) v
-      FROM funds
-      WHERE project_id = ?
-        AND kind = 'allocation'
-    `).get(adminFund.id);
-
-    const available = receivedRow.v - releasedRow.v;
-
-    if (amountPaise > available) {
-      throw new Error(
-        `Only ₹${toRupees(available)} is available in Admin Fund`
-      );
-    }
-
-    const createdAt = now();
-
-    // 1. Remove money from ADMIN-FUND.
-    await db.prepare(`
-      INSERT INTO funds
-        (id, project_id, amount, date, note, added_by, created_at, kind, to_user)
-      VALUES
-        (?,?,?,?,?,?,?,'allocation',NULL)
-    `).run(
-      uid(),
-      adminFund.id,
-      amountPaise,
-      date,
-      note || `Released to project ${projectId}`,
-      req.user.id,
-      createdAt
-    );
-
-    // 2. Put the same money into the selected project.
-    await db.prepare(`
-      INSERT INTO funds
-        (id, project_id, amount, date, note, added_by, created_at, kind, to_user)
-      VALUES
-        (?,?,?,?,?,?,?,'injection',NULL)
-    `).run(
-      uid(),
-      projectId,
-      amountPaise,
-      date,
-      note || `Received from Admin Fund`,
-      req.user.id,
-      createdAt
-    );
-
-    await logAudit(
-      req.user,
-      'Released funds to project',
-      'funds',
-      projectId,
-      `₹${amount} from ADMIN-FUND`
-    );
-  });
-
-  res.json({ ok: true });
-});
-
-// Item 5 -- checker (custodian) allocates a slice of the project pool to a site (internal transfer)
-router.post('/funds/allocate', requireRole('checker', 'admin'), async (req, res) => {
-  const { projectId, toUser, amount, date, note } = req.body;
-  if (!projectId || !toUser || !amount || !date) return res.status(400).json({ error: 'Project, site, amount and date required' });
-  if (!inScope(req.user, projectId)) return res.status(403).json({ error: 'Project not in your access' });
-  const site = await loadUser(toUser);
-  if (!site || site.role !== 'site') return res.status(400).json({ error: 'Recipient must be a site user' });
-  if (!site.all_projects && !(site.project_ids || []).includes(projectId)) return res.status(400).json({ error: 'That site is not assigned to this project' });
-  const injRow = await db.prepare("SELECT COALESCE(SUM(amount),0) v FROM funds WHERE kind='injection' AND project_id=?").get(projectId);
-  const allocRow = await db.prepare("SELECT COALESCE(SUM(amount),0) v FROM funds WHERE kind='allocation' AND project_id=?").get(projectId);
-  const available = injRow.v - allocRow.v; // paise
-  if (toPaise(amount) > available) return res.status(400).json({ error: `Only ${'\u20b9'}${toRupees(available)} is available to distribute in this project` });
-  await db.prepare("INSERT INTO funds (id,project_id,amount,date,note,added_by,created_at,kind,to_user) VALUES (?,?,?,?,?,?,?,'allocation',?)")
-    .run(uid(), projectId, toPaise(amount), date, note || null, req.user.id, now(), toUser);
-  await logAudit(req.user, 'Allocated funds to site', 'funds', projectId, '\u20b9' + amount + ' \u2192 ' + (site.name || toUser));
-  res.json({ ok: true });
+  const funds = await db.prepare(`SELECT * FROM funds WHERE kind='allocation' AND to_user IS NOT NULL AND project_id IN (${inq}) ORDER BY created_at DESC`).all(...projFilter);
+  res.json({ role, totals: siteBalances.reduce((t, b) => ({ received: t.received + b.received, spent: t.spent + b.spent, balance: t.balance + b.balance }), { received: 0, spent: 0, balance: 0 }), siteBalances, funds: funds.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: m.usr[f.to_user] || null })) });
 });
 
 // ================================================================ USERS & ACCESS (admin)
@@ -892,6 +709,7 @@ router.get('/users', requireRole('admin'), async (req, res) => {
 router.post('/users', requireRole('admin'), async (req, res) => {
   const { username, name, role, password, allProjects, projectIds } = req.body;
   if (!username || !name || !role || !password) return res.status(400).json({ error: 'Missing fields' });
+  if (!USER_ROLES.has(role)) return res.status(400).json({ error: 'Select a valid SiteRoad role' });
   if (await db.prepare('SELECT 1 FROM users WHERE username=?').get(username)) return res.status(409).json({ error: 'Username exists' });
   const id = uid();
   await db.prepare('INSERT INTO users (id,username,name,password_hash,role,all_projects,active,created_at) VALUES (?,?,?,?,?,?,1,?)')
@@ -908,6 +726,7 @@ router.patch('/users/:id', requireRole('admin'), async (req, res) => {
   const u = await db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
   if (!u) return res.status(404).json({ error: 'Not found' });
   const { username, name, role, password, allProjects, projectIds } = req.body;
+  if (role && !USER_ROLES.has(role)) return res.status(400).json({ error: 'Select a valid SiteRoad role' });
   const newUsername = (username || '').trim();
   if (newUsername && newUsername !== u.username) {
     const clash = await db.prepare('SELECT 1 FROM users WHERE username=? AND id!=?').get(newUsername, u.id);
@@ -935,7 +754,7 @@ router.post('/users/:id/toggle', requireRole('admin'), async (req, res) => {
 
 // ================================================================ ACCOUNT CHECKERS (accounts manager)
 function requireAccountCheckerTarget(req, res, next) {
-  if (req.user.role !== 'accounts') return res.status(403).json({ error: 'Not permitted' });
+  if (req.user.role !== 'accounts_manager') return res.status(403).json({ error: 'Not permitted' });
   return next();
 }
 
@@ -996,7 +815,7 @@ router.post('/account-checkers/:id/toggle', requireAccountCheckerTarget, async (
   res.json({ ok: true });
 });
 
-router.post('/me/password', requireRole('admin', 'accounts', 'account_checker'), async (req, res) => {
+router.post('/me/password', requireRole('admin', 'accounts_manager', 'account_checker'), async (req, res) => {
   const password = String(req.body.password || '');
   if (!password) return res.status(400).json({ error: 'Password is required' });
   await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), req.user.id);
@@ -1053,7 +872,7 @@ router.post('/masters/:type/:id/rename', requireRole('admin'), async (req, res) 
 });
 
 // ================================================================ REPORTS (CSV)
-router.get('/reports/expenses.csv', requireRole('accounts', 'admin'), async (req, res) => {
+router.get('/reports/expenses.csv', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const m = await nameMaps();
   const sc = scopeClause(req.user, 'e');
   const params = [...sc.params];
@@ -1087,7 +906,7 @@ router.get('/reports/expenses.csv', requireRole('accounts', 'admin'), async (req
 
 //===============================================================================================================================
 // Download one approved, unpaid payment with its payment data and attachments.
-router.get('/payments/:id/download', requireRole('accounts', 'admin'), async (req, res) => {
+router.get('/payments/:id/download', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
 
   if (!e) return res.status(404).json({ error: 'Payment not found' });
@@ -1116,7 +935,7 @@ router.get('/payments/:id/download', requireRole('accounts', 'admin'), async (re
 
 
 // Download selected approved, unpaid payments with their payment data and attachments.
-router.post('/payments/download', requireRole('accounts', 'admin'), async (req, res) => {
+router.post('/payments/download', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const ids = Array.isArray(req.body.ids)
     ? [...new Set(req.body.ids.map(String).filter(Boolean))]
     : [];
@@ -1156,7 +975,7 @@ router.post('/payments/download', requireRole('accounts', 'admin'), async (req, 
 });
 
 // Download selected vouchers that have completed the approval workflow.
-router.post('/vouchers/download', requireRole('accounts', 'admin'), async (req, res) => {
+router.post('/vouchers/download', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const ids = Array.isArray(req.body.ids)
     ? [...new Set(req.body.ids.map(String).filter(Boolean))]
     : [];
@@ -1204,7 +1023,7 @@ router.post('/vouchers/download', requireRole('accounts', 'admin'), async (req, 
 //
 // Workflow:
 // Approved -> Payment Approved
-router.post('/payments', requireRole('accounts', 'admin'), async (req, res) => {
+router.post('/payments', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
 
   if (!ids.length) {
@@ -1278,79 +1097,8 @@ router.post('/payments', requireRole('accounts', 'admin'), async (req, res) => {
 
 
 
-// Admin confirms that the payment has actually been received.
-//
-// Workflow:
-// Payment Approved -> Paid
-//
-// IMPORTANT:
-// expenses.paid is NOT changed.
-// It remains the creator's original Paid/Unpaid selection.
-router.post(
-  '/payments/received',
-  requireRole('admin'),
-  async (req, res) => {
-    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-
-    if (!ids.length) {
-      return res.status(400).json({ error: 'No vouchers selected' });
-    }
-
-    let received = 0;
-
-    for (const id of ids) {
-      const e = await db.prepare(
-        'SELECT * FROM expenses WHERE id=?'
-      ).get(id);
-
-      if (
-        !e ||
-        e.status !== 'Payment Approved' ||
-        !canSeeExpense(req.user, e)
-      ) {
-        continue;
-      }
-
-      const receivedTime = now();
-
-      // Final company payment state.
-      //
-      // DO NOT change e.paid.
-      await db.prepare(`
-        UPDATE expenses
-        SET
-          status='Paid',
-          payment_status='Paid'
-        WHERE id=?
-          AND status='Payment Approved'
-      `).run(id);
-
-      await addHistory(
-        id,
-        req.user.id,
-        'Payment received',
-        'Admin confirmed that the payment was received'
-      );
-
-      await logAudit(
-        req.user,
-        'Confirmed payment received',
-        'expense',
-        e.voucher_no,
-        '₹' + toRupees(e.amount)
-      );
-
-      received++;
-    }
-
-    res.json({
-      ok: true,
-      received
-    });
-  }
-);
 // ================================================================ BUDGETS (#9 -- accounts/admin)
-router.get('/budgets', requireRole('accounts', 'admin'), async (req, res) => {
+router.get('/budgets', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const m = await nameMaps();
   const period = req.query.period || null;
   const rows = period
@@ -1361,7 +1109,7 @@ router.get('/budgets', requireRole('accounts', 'admin'), async (req, res) => {
     name: (m.proj[b.project_id] || {}).name || '', period: b.period, budget: toRupees(b.budget_amount),
   })));
 });
-router.post('/budgets', requireRole('accounts', 'admin'), async (req, res) => {
+router.post('/budgets', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const { projectId, period, amount } = req.body;
   if (!projectId || !period || amount == null) return res.status(400).json({ error: 'Project, period and amount required' });
   if (!/^\d{4}-\d{2}$/.test(period)) return res.status(400).json({ error: 'Period must be YYYY-MM' });
@@ -1375,7 +1123,7 @@ router.post('/budgets', requireRole('accounts', 'admin'), async (req, res) => {
   await logAudit(req.user, 'Set project budget', 'budget', projectId, `${period}: ₹${amount}`);
   res.json({ ok: true });
 });
-router.delete('/budgets/:id', requireRole('accounts', 'admin'), async (req, res) => {
+router.delete('/budgets/:id', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const b = await db.prepare('SELECT * FROM project_budgets WHERE id=?').get(req.params.id);
   if (!b) return res.status(404).json({ error: 'Not found' });
   await db.prepare('DELETE FROM project_budgets WHERE id=?').run(req.params.id);
@@ -1383,7 +1131,7 @@ router.delete('/budgets/:id', requireRole('accounts', 'admin'), async (req, res)
   res.json({ ok: true });
 });
 
-router.get('/analytics', requireRole('accounts', 'admin'), async (req, res) => {
+router.get('/analytics', requireRole('accounts_manager', 'admin'), async (req, res) => {
   const m = await nameMaps();
   const SPEND = "status NOT IN ('Draft','Rejected')";
   const byCategory = (await db.prepare(`SELECT category_id, SUM(amount) v, COUNT(*) c FROM expenses WHERE ${SPEND} GROUP BY category_id ORDER BY v DESC`)
@@ -1404,12 +1152,11 @@ router.get('/analytics', requireRole('accounts', 'admin'), async (req, res) => {
 
   // ---- money health ----
   const users = {}; (await db.prepare('SELECT id,name,role FROM users').all()).forEach(u => users[u.id] = u);
-  const spentByUser = {}; (await db.prepare(`SELECT created_by, SUM(amount) v FROM expenses WHERE ${SPEND} GROUP BY created_by`).all()).forEach(r => spentByUser[r.created_by] = toRupees(r.v));
+  const spentByUser = {}; (await db.prepare(`SELECT COALESCE(site_user_id,created_by) site_user_id, SUM(amount) v FROM expenses WHERE ${SPEND} GROUP BY COALESCE(site_user_id,created_by)`).all()).forEach(r => spentByUser[r.site_user_id] = toRupees(r.v));
   const releasedRow = await db.prepare(`
     SELECT COALESCE(SUM(f.amount),0) v
     FROM funds f
-    JOIN projects p ON p.id=f.project_id
-    WHERE f.kind='injection' AND p.code!='ADMIN-FUND'
+    WHERE f.kind='allocation' AND f.to_user IS NOT NULL
   `).get();
   const released = toRupees(releasedRow.v);
   const allocationBySite = (await db.prepare("SELECT to_user, SUM(amount) v FROM funds WHERE kind='allocation' GROUP BY to_user").all())
@@ -1452,7 +1199,7 @@ router.get('/analytics', requireRole('accounts', 'admin'), async (req, res) => {
     if (at('approved') && at('accounts')) { acc.approved.t += at('approved') - at('accounts'); acc.approved.n++; }
     ['check', 'purchase', 'operations', 'accounts', 'approved'].forEach(k => { if (ap[k] && ap[k].by) cleared[ap[k].by] = (cleared[ap[k].by] || 0) + 1; });
   });
-  const stageLabel = { check: 'Submit → Checked', purchase: 'Checked → Purchase', operations: 'Purchase → Operations', accounts: 'Operations → Accounts', approved: 'Accounts → Approved' };
+  const stageLabel = { check: 'Submit → General Manager', purchase: 'General Manager → Project Director / Incharge', operations: 'Project Director / Incharge → Senior Accountant', accounts: 'Senior Accountant → Accounts Manager / Head', approved: 'Accounts Manager / Head → Approved' };
   const turnaround = ['check', 'purchase', 'operations', 'accounts', 'approved'].map(k => ({ stage: stageLabel[k], avgDays: acc[k].n ? +(acc[k].t / acc[k].n / DAY).toFixed(1) : 0, count: acc[k].n }));
   const throughput = Object.entries(cleared).map(([id, c]) => ({ name: (users[id] || {}).name || '—', role: (users[id] || {}).role || '', cleared: c })).sort((a, b) => b.cleared - a.cleared);
 
@@ -1477,7 +1224,7 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
 
 router.get(
   '/fund-requests/eligible',
-  requireRole('admin'),
+  requireRole('senior_accountant', 'admin'),
   async (req, res) => {
     const m = await nameMaps();
     const sc = scopeClause(req.user, 'e');
@@ -1508,6 +1255,7 @@ router.get(
       locationName: m.loc[e.location_id] || '',
       categoryName: m.cat[e.category_id] || '',
       createdByName: m.usr[e.created_by] || '',
+      siteUserName: m.usr[e.site_user_id || e.created_by] || '',
       amount: toRupees(e.amount)
     }));
 
@@ -1517,21 +1265,35 @@ router.get(
 
 router.get(
   '/fund-requests',
-  requireRole('purchase', 'admin', 'accounts'),
+  requireRole('project_director', 'senior_accountant', 'site_accounts', 'admin', 'accounts_manager'),
   async (req, res) => {
+    const scope = scopeOf(req.user);
+    const projectScopeSql = scope.all ? '' : scope.ids.length
+      ? `AND NOT EXISTS (SELECT 1 FROM fund_request_items fri_scope JOIN expenses e_scope ON e_scope.id=fri_scope.expense_id WHERE fri_scope.fund_request_id=fr.id AND e_scope.project_id NOT IN (${scope.ids.map(() => '?').join(',')}))`
+      : 'AND 1=0';
+    const params = [...scope.ids];
+    let scopeSql = projectScopeSql;
+    if (req.user.role === 'site_accounts') {
+      scopeSql += " AND fr.status='Released' AND fr.site_user_id=?";
+      params.push(req.user.id);
+    }
     const rows = await db.prepare(`
       SELECT
         fr.*,
         u.name AS created_by_name,
+        su.name AS site_user_name,
         COUNT(fri.id) AS item_count
       FROM fund_requests fr
       JOIN users u
         ON u.id = fr.created_by
+      LEFT JOIN users su
+        ON su.id = fr.site_user_id
       LEFT JOIN fund_request_items fri
         ON fri.fund_request_id = fr.id
-      GROUP BY fr.id, u.name
+      WHERE 1=1 ${scopeSql}
+      GROUP BY fr.id, u.name, su.name
       ORDER BY fr.created_at DESC
-    `).all();
+    `).all(...params);
 
     res.json(rows.map(r => ({
       ...r,
@@ -1543,15 +1305,18 @@ router.get(
 
 router.get(
   '/fund-requests/:id',
-  requireRole('purchase', 'admin' , 'accounts'),
+  requireRole('project_director', 'senior_accountant', 'site_accounts', 'admin', 'accounts_manager'),
   async (req, res) => {
-    const request = await db.prepare(`
-      SELECT
-        fr.*,
-        u.name AS created_by_name
-      FROM fund_requests fr
-      JOIN users u
-        ON u.id = fr.created_by
+      const request = await db.prepare(`
+        SELECT
+          fr.*,
+          u.name AS created_by_name,
+          su.name AS site_user_name
+        FROM fund_requests fr
+        JOIN users u
+          ON u.id = fr.created_by
+        LEFT JOIN users su
+          ON su.id = fr.site_user_id
       WHERE fr.id = ?
     `).get(req.params.id);
 
@@ -1574,6 +1339,12 @@ router.get(
       WHERE fri.fund_request_id = ?
       ORDER BY e.date DESC, e.created_at DESC
     `).all(req.params.id);
+    if (items.some(e => !canSeeExpense(req.user, e))) {
+      return res.status(403).json({ error: 'Fund request is outside your project access' });
+    }
+    if (req.user.role === 'site_accounts' && (request.status !== 'Released' || request.site_user_id !== req.user.id)) {
+      return res.status(404).json({ error: 'Released fund request not found for this Site Accounts user' });
+    }
 
     const itemsWithHistory = await Promise.all(
       items.map(async (e) => {
@@ -1626,6 +1397,12 @@ router.get(
         locationName:
           m.loc[e.location_id] || '',
 
+        siteUserName:
+          m.usr[e.site_user_id || e.created_by] || '',
+
+        voucherPrintedByName:
+          e.voucher_printed_by ? m.usr[e.voucher_printed_by] || '' : '',
+
         categoryName:
           m.cat[e.category_id] || '',
 
@@ -1655,7 +1432,7 @@ router.get(
 
 router.post(
   '/fund-requests/:id/print',
-  requireRole('purchase', 'admin'),
+  requireRole('senior_accountant', 'admin'),
   async (req, res) => {
     const result = await db.transaction(async () => {
       const request = await db.prepare(`
@@ -1669,10 +1446,8 @@ router.post(
         throw new Error('Fund request not found');
       }
 
-      if (['Completed', 'Cancelled'].includes(request.status)) {
-        throw new Error(
-          `Cannot print a ${request.status.toLowerCase()} fund request`
-        );
+      if (!['Requested', 'Printed'].includes(request.status)) {
+        throw new Error(`Only Requested fund requests can be printed (current status: ${request.status})`);
       }
 
       const printedAt = now();
@@ -1712,17 +1487,55 @@ router.post(
 );
 
 router.post(
+  '/fund-requests/:id/vouchers/:expenseId/mark-printed',
+  requireRole('senior_accountant', 'admin'),
+  async (req, res) => {
+    const result = await db.transaction(async () => {
+      const request = await db.prepare('SELECT * FROM fund_requests WHERE id=? FOR UPDATE').get(req.params.id);
+      if (!request) throw new Error('Fund request not found');
+      if (request.status !== 'Printed') throw new Error('Mark the fund request as printed before marking its vouchers');
+
+      const expense = await db.prepare(`
+        SELECT e.* FROM expenses e
+        JOIN fund_request_items fri ON fri.expense_id=e.id
+        WHERE fri.fund_request_id=? AND e.id=?
+        FOR UPDATE
+      `).get(request.id, req.params.expenseId);
+      if (!expense) throw new Error('Voucher is not part of this fund request');
+      if (expense.status !== 'Payment Approved') throw new Error(`Voucher ${expense.voucher_no} is no longer eligible for printing`);
+      if (!canSeeExpense(req.user, expense)) throw new Error('Voucher is outside your project access');
+      if (expense.voucher_printed_at) {
+        return { alreadyPrinted: true, printedAt: expense.voucher_printed_at, printedBy: expense.voucher_printed_by };
+      }
+
+      const printedAt = now();
+      await db.prepare('UPDATE expenses SET voucher_printed_at=?,voucher_printed_by=?,updated_at=? WHERE id=? AND voucher_printed_at IS NULL')
+        .run(printedAt, req.user.id, printedAt, expense.id);
+      await addHistory(expense.id, req.user.id, 'Voucher marked printed', `Printed as part of fund request ${request.request_no}`);
+      await logAudit(req.user, 'Marked voucher printed', 'expense', expense.voucher_no, `Fund request ${request.request_no}`);
+      return { alreadyPrinted: false, printedAt, printedBy: req.user.id, voucherNo: expense.voucher_no };
+    });
+    res.json({ ok: true, ...result });
+  }
+);
+
+router.post(
   '/fund-requests',
-  requireRole('admin'),
+  requireRole('senior_accountant', 'admin'),
   async (req, res) => {
     const ids = Array.isArray(req.body.ids)
       ? [...new Set(req.body.ids.map(String).filter(Boolean))]
       : [];
+    const siteUserId = String(req.body.siteUserId || '').trim();
 
     if (!ids.length) {
       return res.status(400).json({
         error: 'No vouchers selected'
       });
+    }
+
+    if (!siteUserId) {
+      return res.status(400).json({ error: 'Select the Site Accounts user who will receive these funds' });
     }
 
     const result = await db.transaction(async () => {
@@ -1740,6 +1553,23 @@ router.post(
         throw new Error(
           'One or more selected vouchers are no longer available for fund request'
         );
+      }
+
+      const siteUser = await loadUser(siteUserId);
+      if (!siteUser || siteUser.role !== 'site_accounts' || !siteUser.active) {
+        throw new Error('The selected recipient must be an active Site Accounts user');
+      }
+      const projectIds = [...new Set(expenses.map(e => e.project_id))];
+      for (const e of expenses) {
+        let ownerId = e.site_user_id;
+        if (!ownerId) {
+          const creator = await loadUser(e.created_by);
+          if (creator && creator.role === 'site_accounts') ownerId = creator.id;
+        }
+        if (ownerId !== siteUserId) throw new Error(`Voucher ${e.voucher_no} is not assigned to the selected Site Accounts user`);
+      }
+      if (!siteUser.all_projects && projectIds.some(pid => !(siteUser.project_ids || []).includes(pid))) {
+        throw new Error('The selected Site Accounts user is not assigned to every project in this request');
       }
 
       for (const e of expenses) {
@@ -1777,15 +1607,17 @@ router.post(
             created_by,
             created_at,
             status,
-            total_amount
+            total_amount,
+            site_user_id
           )
-        VALUES (?, ?, ?, ?, 'Requested', ?)
+        VALUES (?, ?, ?, ?, 'Requested', ?, ?)
       `).run(
         requestId,
         requestNo,
         req.user.id,
         createdAt,
-        total
+        total,
+        siteUserId
       );
 
       for (const e of expenses) {
@@ -1841,29 +1673,13 @@ router.post(
 // ================================================================
 // FUND REQUEST RELEASE
 //
-// Accounts performs the actual money release.
-// This is the ONLY step in the new workflow that:
-//   - marks the voucher Paid
-//   - marks payment_status as Paid
-//   - records the released money in ADMIN-FUND
-//
-// expenses.paid is NOT changed here.
-// It remains the creator's original Paid/Unpaid selection.
-//
-// Workflow:
-// Payment Approved
-//      ↓
-// Fund Requested
-//      ↓
-// Printed
-//      ↓
-// Payment Released
-//      ↓
-// Paid
+// Senior Accountant prints; Accounts Manager / Head releases. The assigned Site Accounts user then
+// confirms receipt, which credits their balance and completes the request.
+// Workflow: Payment Approved -> Requested -> Printed -> Released -> Completed.
 
 router.post(
   '/fund-requests/:id/release',
-  requireRole('accounts'),
+  requireRole('accounts_manager', 'admin'),
   async (req, res) => {
     const result = await db.transaction(async () => {
 
@@ -1885,6 +1701,10 @@ router.post(
           `Only Printed fund requests can be released (current status: ${request.status})`
         );
       }
+      const recipient = request.site_user_id ? await loadUser(request.site_user_id) : null;
+      if (!recipient || recipient.role !== 'site_accounts' || !recipient.active) {
+        throw new Error('The Site Accounts recipient is missing or inactive');
+      }
 
       // Get all vouchers belonging to this request.
       const items = await db.prepare(`
@@ -1905,7 +1725,6 @@ router.post(
 
       // Make sure every voucher is still valid.
       for (const e of items) {
-
         if (e.status !== 'Payment Approved') {
           throw new Error(
             `${e.voucher_no} is no longer Payment Approved`
@@ -1917,102 +1736,26 @@ router.post(
             `Voucher ${e.voucher_no} is outside your project access`
           );
         }
-
-        
+        if ((e.site_user_id || e.created_by) !== recipient.id) {
+          throw new Error(`Voucher ${e.voucher_no} does not belong to the selected Site Accounts recipient`);
+        }
       }
 
       const releasedAt = now();
-
-      /*
-       * Mark every voucher as actually paid.
-       */
       for (const e of items) {
-
-        await db.prepare(`
-          UPDATE expenses
-          SET
-            status = 'Paid',
-            payment_status = 'Paid',
-            updated_at = ?
-          WHERE id = ?
-            AND status = 'Payment Approved'
-        `).run(
-          releasedAt,
-          e.id
-        );
-
         await addHistory(
           e.id,
           req.user.id,
-          'Payment Released',
-          `Fund request ${request.request_no} released`
+          'Funds released',
+          `Fund request ${request.request_no} released; awaiting confirmation from ${recipient.name}`
         );
-
-        await logAudit(
-          req.user,
-          'Payment Released',
-          'expense',
-          e.voucher_no,
-          `Fund request ${request.request_no} · ₹${toRupees(e.amount)}`
-        );
-
-        /*
-         * The funds table represents actual allocation/release.
-         *
-         * One allocation is created per voucher so that the ledger
-         * remains traceable back to the individual voucher.
-         *
-         * request.created_by is the Admin who created the request
-         * (Vipul Sir in the intended workflow).
-         */
-        // Payment released by Accounts goes into the Admin wallet.
-        // ADMIN-FUND is the central wallet used by Admin to
-        // subsequently distribute money to projects.
-        const adminFund = await db.prepare(`
-          SELECT id
-          FROM projects
-          WHERE code = 'ADMIN-FUND'
-          LIMIT 1
-        `).get();
-
-        if (!adminFund) {
-          throw new Error('ADMIN-FUND project is missing');
-        }
-
-        await db.prepare(`
-          INSERT INTO funds
-            (
-              id,
-              project_id,
-              amount,
-              date,
-              note,
-              added_by,
-              created_at,
-              kind,
-              to_user
-            )
-          VALUES
-            (?,?,?,?,?,?,?,'injection',NULL)
-        `).run(
-          uid(),
-          adminFund.id,
-          e.amount,
-          new Date(releasedAt).toISOString().slice(0, 10),
-          `Fund release ${request.request_no} · ${e.voucher_no}`,
-          req.user.id,
-          releasedAt
-        );
+        await logAudit(req.user, 'Funds released pending receipt', 'expense', e.voucher_no, `Fund request ${request.request_no} · ₹${toRupees(e.amount)}`);
       }
 
-      /*
-       * Complete the fund request only after every voucher
-       * and every funds ledger entry succeeded.
-       */
       await db.prepare(`
         UPDATE fund_requests
         SET
-          status = 'Completed',
+          status = 'Released',
           released_at = ?,
           released_by = ?
         WHERE id = ?
@@ -2028,7 +1771,7 @@ router.post(
         'Released fund request',
         'fund_request',
         request.request_no,
-        `₹${toRupees(request.total_amount)} · ${items.length} voucher(s)`
+        `₹${toRupees(request.total_amount)} · ${items.length} voucher(s); awaiting receipt confirmation by ${recipient.name}`
       );
 
       return {
@@ -2045,5 +1788,52 @@ router.post(
     });
   }
 );
+
+router.post('/fund-requests/:id/confirm-receipt', requireRole('site_accounts'), async (req, res) => {
+  const result = await db.transaction(async () => {
+    const request = await db.prepare('SELECT * FROM fund_requests WHERE id=? FOR UPDATE').get(req.params.id);
+    if (!request) throw new Error('Fund request not found');
+    if (request.status !== 'Released') throw new Error(`Only Released requests can be receipt-confirmed (current status: ${request.status})`);
+    if (!request.site_user_id) throw new Error('Fund request has no Site Accounts recipient');
+    if (request.site_user_id !== req.user.id) throw new Error('Only the assigned Site Accounts user can confirm receipt');
+
+    const recipient = await loadUser(request.site_user_id);
+    if (!recipient || recipient.role !== 'site_accounts' || !recipient.active) throw new Error('Fund request recipient is not an active Site Accounts user');
+    const items = await db.prepare(`
+      SELECT fri.amount requested_amount, e.*
+      FROM fund_request_items fri JOIN expenses e ON e.id=fri.expense_id
+      WHERE fri.fund_request_id=? FOR UPDATE
+    `).all(request.id);
+    if (!items.length) throw new Error('Fund request contains no vouchers');
+    for (const e of items) {
+      if (e.status !== 'Payment Approved') throw new Error(`${e.voucher_no} is no longer Payment Approved`);
+      if (!canSeeExpense(req.user, e)) throw new Error(`Voucher ${e.voucher_no} is outside your project access`);
+      if ((e.site_user_id || e.created_by) !== recipient.id) throw new Error(`Voucher ${e.voucher_no} is assigned to another Site Accounts user`);
+      if (!recipient.all_projects && !(recipient.project_ids || []).includes(e.project_id)) throw new Error('The Site Accounts recipient is not assigned to every project in this request');
+    }
+
+    const receivedAt = now();
+    for (const e of items) {
+      const project = await db.prepare('SELECT id FROM projects WHERE id=?').get(e.project_id);
+      await db.prepare(`
+        INSERT INTO funds (id,project_id,amount,date,note,added_by,created_at,kind,to_user)
+        VALUES (?,?,?,?,?,?,?,'allocation',?)
+      `).run(uid(), project.id, e.requested_amount, new Date(receivedAt).toISOString().slice(0, 10), `Received ${request.request_no} · ${e.voucher_no}`, req.user.id, receivedAt, recipient.id);
+      await db.prepare(`
+        UPDATE expenses SET status='Paid', payment_status='Paid', paid_at=?, paid_by=?, updated_at=?
+        WHERE id=? AND status='Payment Approved'
+      `).run(String(receivedAt), req.user.id, receivedAt, e.id);
+      await addHistory(e.id, req.user.id, 'Funds received', `Confirmed receipt for ${request.request_no}; credited to ${recipient.name}`);
+      await logAudit(req.user, 'Confirmed fund receipt', 'expense', e.voucher_no, `₹${toRupees(e.requested_amount)} credited to ${recipient.name}`);
+    }
+    await db.prepare(`
+      UPDATE fund_requests SET status='Completed', receipt_confirmed_at=?, receipt_confirmed_by=?
+      WHERE id=? AND status='Released'
+    `).run(receivedAt, req.user.id, request.id);
+    await logAudit(req.user, 'Confirmed fund request receipt', 'fund_request', request.request_no, `₹${toRupees(request.total_amount)} credited to ${recipient.name}`);
+    return { requestNo: request.request_no, total: toRupees(request.total_amount), siteUserName: recipient.name, receivedAt };
+  });
+  res.json({ ok: true, ...result });
+});
 
 module.exports = router;

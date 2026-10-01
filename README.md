@@ -1,6 +1,6 @@
-# SiteXpense — Node.js edition
+# SiteRoad V2 — Node.js edition
 
-A real client–server version of SiteXpense. One shared database, so **site phones at
+A real client–server application for SiteRoad. One shared database, so **site phones at
 different locations enter data and head office sees everything live** — the limitation
 the single-file browser prototype could never overcome.
 
@@ -13,9 +13,9 @@ the single-file browser prototype could never overcome.
 ## What it enforces (server-side, can't be bypassed)
 - **Project-wise + profile-wise access** — each user has a role and either "all projects"
   (head office) or a list of allowed projects. Site users see only their own vouchers.
-- **Sequential review** — Checker → Purchase → Operations → Accounts → *Approved*.
+- **Sequential review** — General Manager → Project Director / Incharge → Senior Accountant → Accounts Manager / Head → *Approved*.
   Stages cannot be skipped or reordered; financial fields are frozen during review.
-- **Funds & balance** — head office records money given per project; balance = given − spent.
+- **SiteRoad funds** — Senior Accountant creates and prints fund requests for a specific Site Accounts user. Accounts Manager / Head releases them; the assigned Site Accounts user confirms receipt, which then increases their usable balance.
 - **Queries, rejections, full audit log, CSV export.**
 
 ## Run it locally
@@ -29,24 +29,24 @@ Either way, you end up with a connection string that looks like:
 postgresql://user:password@host:5432/dbname
 ```
 
-**2. Set it as an environment variable and start the app:**
-```bash
-cd sitexpense-node
-npm install
-DATABASE_URL="postgresql://user:password@host:5432/dbname" npm start
-```
-Open http://localhost:3000
+**2. Configure the app in `.env`.** Copy `.env.example` to `.env` in the project
+folder, then set `SITEROAD_DATABASE_URL` to SiteRoad's own database connection string
+and replace `SESSION_SECRET` with a long random value. Keep `.env` private; it is
+excluded from Git. `PORT` defaults to `3060` in the example and can be changed there.
+In PowerShell, make the copy with `Copy-Item .env.example .env`.
 
-On Windows PowerShell, set the variable first, then start:
-```powershell
-$env:DATABASE_URL="postgresql://user:password@host:5432/dbname"
+Start the app after saving `.env`:
+```bash
+cd SiteRoad_V2
+npm install
 npm start
 ```
+Open `http://localhost:<PORT>` (the example uses port `3060`). Values set directly
+in the server environment take precedence over `.env`.
 
 The first boot creates every table automatically and seeds demo data — nothing to run
-by hand. If you'd rather not retype `DATABASE_URL` every time, most hosting platforms
-let you set environment variables once in their dashboard; locally, a `.env` file plus
-a loader like `dotenv` works too (not included here, to keep dependencies minimal).
+by hand. Hosted services can continue to provide these settings as environment
+variables instead of using a `.env` file.
 
 > If the database is a managed cloud host, it almost certainly requires SSL — this is
 > handled automatically (any host other than `localhost` gets SSL by default). Force it
@@ -56,11 +56,11 @@ a loader like `dotenv` works too (not included here, to keep dependencies minima
 | Username | Password | Role | Access |
 |---|---|---|---|
 | admin | admin123 | Administrator | all projects |
-| site | site123 | Site Person | DM, MG only (sees own entries) |
-| checker | check123 | Checker | all projects |
-| purchase | pur123 | Purchase Reviewer | all projects |
-| operations | ops123 | Operations Reviewer | all projects |
-| accounts | acc123 | Accounts Manager | all projects |
+| site | site123 | Site Accounts | DM, MG only (sees own entries) |
+| general_manager | check123 | General Manager | all projects |
+| project_director | pur123 | Project Director / Incharge | all projects |
+| senior_accountant | ops123 | Senior Accountant | all projects |
+| accounts_manager | acc123 | Accounts Manager / Head | all projects |
 
 > ⚠️ **Before real use:** these passwords are fixed in the source and documented here,
 > so they must not stay active on a server real people can reach. Sign in as `admin` →
@@ -70,18 +70,18 @@ a loader like `dotenv` works too (not included here, to keep dependencies minima
 
 ## Let phones reach head office
 On your own network: run it on the office machine (pointed at your Postgres database)
-and open `http://<that-machine-ip>:3000` from the phones.
+and open `http://<that-machine-ip>:3060` from the phones (or the port set in `PORT`).
 
 For real multi-location use over the internet, deploy to any Node host (Render, Railway,
 Fly.io, a small VPS) and point it at your Postgres database — most of these hosts also
 offer Postgres directly, so the app and the database can live on the same platform. Set
 these environment variables on the host:
 ```
-PORT=3000
+PORT=3060
 NODE_ENV=production
 SESSION_SECRET=<a long random string>
 SECURE_COOKIES=1
-DATABASE_URL=<your Postgres connection string>
+SITEROAD_DATABASE_URL=<SiteRoad Postgres connection string>
 ```
 Put it behind HTTPS (most hosts do this automatically; `SECURE_COOKIES=1` then makes the
 login cookie HTTPS-only — leave it unset on plain-localhost testing).
@@ -121,8 +121,8 @@ Use your Postgres host's own backup/export tools (most managed hosts — Supabas
 Neon, etc. — take automatic daily backups and let you restore to a point in time from
 their dashboard). To do it yourself instead:
 ```bash
-pg_dump "$DATABASE_URL" > backup.sql       # back up
-psql "$DATABASE_URL" < backup.sql          # restore
+pg_dump "$SITEROAD_DATABASE_URL" > backup.sql       # back up
+psql "$SITEROAD_DATABASE_URL" < backup.sql          # restore
 ```
 Evidence photos live in `uploads/` on the server's own disk, separately from the
 database — back that folder up too (and note that "ephemeral" hosting tiers on some

@@ -3,6 +3,7 @@ const { Pool, types } = require('pg');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { AsyncLocalStorage } = require('node:async_hooks');
+require('./env');
 
 // pg returns BIGINT (and NUMERIC) columns as strings by default, because a
 // 64-bit value can exceed what a JS number can represent exactly. Every
@@ -12,18 +13,19 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 // them as ordinary numbers globally.
 types.setTypeParser(20, (v) => (v === null ? null : parseInt(v, 10))); // BIGINT
 
-// Note: The process.env.DATABASE_URL validation block was removed here to prevent crashing
+if (!process.env.SITEROAD_DATABASE_URL) {
+  throw new Error('Set SITEROAD_DATABASE_URL before starting SiteRoad');
+}
 
 const pool = new Pool({
-  // Hardcoded the local connection string here:
-  connectionString: "postgres://postgres:root@localhost:5432/sitexpense",
+  connectionString: process.env.SITEROAD_DATABASE_URL,
   
   // Managed Postgres hosts (Supabase, Render, Railway, Neon, ...) require
   // SSL and use certs not in Node's default trust store; local/Docker
   // Postgres usually has none. Auto-detect by host, override with PGSSL.
   ssl: process.env.PGSSL === '0' ? false
      : process.env.PGSSL === '1' ? { rejectUnauthorized: false }
-     : /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || "localhost") ? false
+     : /localhost|127\.0\.0\.1/.test(process.env.SITEROAD_DATABASE_URL || "localhost") ? false
      : { rejectUnauthorized: false },
 });
 pool.on('error', (err) => console.error('[db] idle client error:', err.message));
@@ -149,6 +151,9 @@ CREATE TABLE IF NOT EXISTS expenses (
   details TEXT,
   project_id TEXT NOT NULL,
   location_id TEXT,
+  site_user_id TEXT,
+  voucher_printed_at BIGINT,
+  voucher_printed_by TEXT,
   expense_done_by TEXT,
   bill_received TEXT,
   bill_no TEXT,
@@ -167,8 +172,13 @@ CREATE TABLE IF NOT EXISTS expenses (
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
   FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE RESTRICT,
   FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE RESTRICT,
-  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (site_user_id) REFERENCES users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (voucher_printed_by) REFERENCES users(id) ON DELETE RESTRICT
 );
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS site_user_id TEXT REFERENCES users(id) ON DELETE RESTRICT;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS voucher_printed_at BIGINT;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS voucher_printed_by TEXT REFERENCES users(id) ON DELETE RESTRICT;
 CREATE TABLE IF NOT EXISTS evidence (
   id TEXT PRIMARY KEY,
   expense_id TEXT NOT NULL,
@@ -212,10 +222,19 @@ CREATE TABLE IF NOT EXISTS fund_requests (
   printed_by TEXT,
   released_at BIGINT,
   released_by TEXT,
+  site_user_id TEXT,
+  receipt_confirmed_at BIGINT,
+  receipt_confirmed_by TEXT,
   FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
   FOREIGN KEY (printed_by) REFERENCES users(id) ON DELETE RESTRICT,
-  FOREIGN KEY (released_by) REFERENCES users(id) ON DELETE RESTRICT
+  FOREIGN KEY (released_by) REFERENCES users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (site_user_id) REFERENCES users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (receipt_confirmed_by) REFERENCES users(id) ON DELETE RESTRICT
 );
+
+ALTER TABLE fund_requests ADD COLUMN IF NOT EXISTS site_user_id TEXT REFERENCES users(id) ON DELETE RESTRICT;
+ALTER TABLE fund_requests ADD COLUMN IF NOT EXISTS receipt_confirmed_at BIGINT;
+ALTER TABLE fund_requests ADD COLUMN IF NOT EXISTS receipt_confirmed_by TEXT REFERENCES users(id) ON DELETE RESTRICT;
 
 CREATE TABLE IF NOT EXISTS fund_request_items (
   id TEXT PRIMARY KEY,
@@ -301,6 +320,36 @@ CREATE INDEX IF NOT EXISTS idx_evidence_exp ON evidence(expense_id);
 CREATE INDEX IF NOT EXISTS idx_history_exp  ON expense_history(expense_id);
 CREATE INDEX IF NOT EXISTS idx_queries_exp  ON queries(expense_id);
 CREATE INDEX IF NOT EXISTS idx_budgets_proj ON project_budgets(project_id);
+UPDATE users SET role = CASE role
+  WHEN 'site' THEN 'site_accounts'
+  WHEN 'checker' THEN 'general_manager'
+  WHEN 'purchase' THEN 'project_director'
+  WHEN 'operations' THEN 'senior_accountant'
+  WHEN 'accounts' THEN 'accounts_manager'
+  ELSE role
+END
+WHERE role IN ('site','checker','purchase','operations','accounts');
+UPDATE expenses e
+SET site_user_id = e.created_by
+FROM users u
+WHERE e.created_by = u.id
+  AND u.role = 'site_accounts'
+  AND e.site_user_id IS NULL;
+UPDATE fund_requests fr
+SET site_user_id = owners.site_user_id
+FROM (
+  SELECT fri.fund_request_id,
+         MIN(COALESCE(e.site_user_id, e.created_by)) AS site_user_id
+  FROM fund_request_items fri
+  JOIN expenses e ON e.id = fri.expense_id
+  GROUP BY fri.fund_request_id
+  HAVING COUNT(DISTINCT COALESCE(e.site_user_id, e.created_by)) = 1
+) owners
+WHERE fr.id = owners.fund_request_id
+  AND fr.site_user_id IS NULL;
+-- Retire the former separate receipt-confirmation profile. Site Accounts users
+-- now confirm their own assigned fund requests.
+UPDATE users SET active=0 WHERE role='site_accountant' AND active<>0;
 `);
 }
 
@@ -335,14 +384,14 @@ async function seed() {
     if (!all) for (const pid of (projIds || [])) await insUP.run(id, pid);
   };
   await mk('u_admin', 'admin', 'System Admin', 'admin123', 'admin', true);
-  await mk('u_site', 'site', 'Suresh Chand (Site)', 'site123', 'site', false, ['p_dm', 'p_mg']);
-  await mk('u_check', 'checker', 'Vipul (Checker)', 'check123', 'checker', true);
-  await mk('u_pur', 'purchase', 'Amrit (Purchase)', 'pur123', 'purchase', true);
-  await mk('u_ops', 'operations', 'Test Operations', 'ops123', 'operations', true);
-  await mk('u_acc', 'accounts', 'Gaurav (Accounts)', 'acc123', 'accounts', true);
+  await mk('u_site', 'site', 'Suresh Chand (Site)', 'site123', 'site_accounts', false, ['p_dm', 'p_mg']);
+  await mk('u_check', 'general_manager', 'Vipul (General Manager)', 'check123', 'general_manager', true);
+  await mk('u_pur', 'project_director', 'Amrit (Project Director)', 'pur123', 'project_director', true);
+  await mk('u_ops', 'senior_accountant', 'Senior Accountant', 'ops123', 'senior_accountant', true);
+  await mk('u_acc', 'accounts_manager', 'Accounts Manager', 'acc123', 'accounts_manager', true);
 
   await db.prepare("INSERT INTO counters (name,seq) VALUES ('voucher',1000)").run();
-  console.log('[db] seeded demo data (admin/admin123, site/site123, checker/check123, purchase/pur123, operations/ops123, accounts/acc123)');
+  console.log('[db] seeded demo data with SiteRoad roles');
 }
 
 // ---------------------------------------------------------------- helpers

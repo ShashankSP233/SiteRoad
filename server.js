@@ -18,7 +18,7 @@ if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
 }
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3060;
 app.set('trust proxy', 1); // most hosts (Render/Railway/etc.) terminate TLS via a proxy
 
 app.use(express.json());
@@ -88,7 +88,7 @@ app.use((err, req, res, next) => {
 ready()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`\n  SiteXpense running ->  http://localhost:${PORT}\n`);
+      console.log(`\n  SiteRoad running ->  http://localhost:${PORT}\n`);
     });
   })
   .catch((err) => {
