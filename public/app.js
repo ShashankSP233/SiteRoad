@@ -3649,7 +3649,7 @@ const ExpenseForm = {
         ${needsOwnerSelection ? `<div class="field full"><label>Site Accounts user responsible for this expense *</label><select id="ef-site-user"><option value="">Select Site Accounts user</option>${siteUsers.map((u) => `<option value="${esc(u.id)}" ${siteUsers.length === 1 ? "selected" : ""}>${esc(u.name)}</option>`).join("")}</select></div>` : ""}
         <div class="frow">
           <div class="field"><label>Bill received?</label><select id="ef-billrec"><option>No</option><option>Yes</option></select></div>
-          <div class="field"><label>Bill No.</label><input id="ef-billno" placeholder="optional"></div>
+          <div class="field"><label>Bill No. / UPI UTR No. *</label><input id="ef-billno" required placeholder="Enter bill number or UPI UTR number"><div class="csub" style="margin:4px 0 0">UPI UTR No. if bill no. not available.</div></div>
         </div>
         <div class="frow">
           <div class="field"><label>Payment</label><select id="ef-paid"><option value="0">Unpaid</option><option value="1">Paid</option></select></div>
@@ -3805,6 +3805,11 @@ const ExpenseForm = {
       !$("#ef-det").value.trim()
     ) {
       toast("Date, amount and details required", "err");
+      return;
+    }
+    if (!$("#ef-billno").value.trim()) {
+      toast("Enter a bill number or UPI UTR number", "err");
+      $("#ef-billno").focus();
       return;
     }
     if (["general_manager", "admin"].includes(S.user.role) && !$("#ef-site-user")?.value) {

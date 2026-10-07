@@ -313,6 +313,13 @@ function entryDateError(dateStr) {
 // P13 -- duplicate if (project+date+amount+category) match, or the bill number matches.
 // amount must be passed in already converted to paise (see toPaise).
 const normBill = s => String(s == null ? '' : s).toLowerCase().replace(/[\s\-/]/g, '').replace(/^0+(?=\d)/, '');
+async function findBillNoDuplicate(billNo, excludeId) {
+  const normalized = normBill(billNo);
+  if (!normalized) return null;
+  const rows = await db.prepare('SELECT voucher_no,bill_no FROM expenses WHERE id!=? AND bill_no IS NOT NULL AND bill_no!=\'\'')
+    .all(excludeId || '');
+  return rows.find(row => normBill(row.bill_no) === normalized) || null;
+}
 async function findDuplicate({ projectId, date, amount, categoryId, billNo, excludeId }) {
   const ex = excludeId || '';
   const a = await db.prepare(
@@ -412,6 +419,10 @@ router.get('/expenses/:id', async (req, res) => {
 router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts', 'general_manager', 'admin'), async (req, res) => {
   const b = req.body;
   if (!b.date || !b.amount || !b.details) return res.status(400).json({ error: 'Date, amount and details required' });
+  const billNo = String(b.billNo || '').trim();
+  if (!billNo) return res.status(400).json({ error: 'Bill No. or UPI UTR No. required' });
+  const existingBillNo = await findBillNoDuplicate(billNo);
+  if (existingBillNo) return res.status(409).json({ error: `Bill No. / UPI UTR No. "${billNo}" is already used on ${existingBillNo.voucher_no}.` });
   if (!inScope(req.user, b.projectId)) return res.status(403).json({ error: 'Project not in your access' });
   const siteUserId = req.user.role === 'site_accounts' ? req.user.id : String(b.siteUserId || '').trim();
   if (!siteUserId) return res.status(400).json({ error: 'Select the Site Accounts user responsible for this expense' });
@@ -432,7 +443,7 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts'
   // P13 -- on submit, alert on a likely duplicate unless the user has confirmed
   const confirmDup = b.confirmDuplicate === 'true' || b.confirmDuplicate === true;
   if (!asDraft && !confirmDup) {
-    const dup = await findDuplicate({ projectId: b.projectId, date: b.date, amount: toPaise(b.amount), categoryId: b.categoryId, billNo: b.billNo });
+    const dup = await findDuplicate({ projectId: b.projectId, date: b.date, amount: toPaise(b.amount), categoryId: b.categoryId, billNo });
     if (dup) return res.status(409).json({ error: dup.message, duplicate: true, match: dup.match });
   }
 
@@ -455,7 +466,7 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts'
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, voucher, b.date, toPaise(b.amount), b.categoryId || null, b.details, b.projectId,
       locationId, siteUserId, b.expenseDoneBy || req.user.name, b.billReceived || 'No',
-      b.billNo || null, 'Pending', b.remark || null, status, approvals,
+      billNo, 'Pending', b.remark || null, status, approvals,
       req.user.id, now(), now(), asDraft ? null : now(),
       b.paid === '1' ? 1 : 0
     );
@@ -480,6 +491,12 @@ router.patch('/expenses/:id', async (req, res) => {
   if (!(isOwnerEditable || req.user.role === 'admin')) return res.status(403).json({ error: 'Not editable' });
   const b = req.body;
   const willSubmit = !b.asDraft;
+  if (b.billNo != null) {
+    const billNo = String(b.billNo).trim();
+    if (!billNo) return res.status(400).json({ error: 'Bill No. or UPI UTR No. required' });
+    const duplicateBillNo = await findBillNoDuplicate(billNo, e.id);
+    if (duplicateBillNo) return res.status(409).json({ error: `Bill No. / UPI UTR No. "${billNo}" is already used on ${duplicateBillNo.voucher_no}.` });
+  }
   // P14 -- keep the 7-day rule on edits too (site only)
   if (req.user.role === 'site_accounts' && b.date) {
     const dErr = entryDateError(b.date);
