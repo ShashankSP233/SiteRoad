@@ -573,13 +573,20 @@ Views.dashboard = async function () {
         : "receipt-confirmed allocations";
   const balSub =
     `${money(spent)} spent`;
+  const accountsManagerBalance = totalPaid - totalApproved;
   $("#content").innerHTML = `
     <div class="grid stat-row" style="margin-bottom:20px">
       <div class="stat accent"><div class="lab">Total Expenses</div><div class="val">${money(total)}</div><div class="sub2">${ex.length} vouchers</div></div>
-      <div class="stat green"><div class="lab">Funds Received</div><div class="val">${money(given)}</div><div class="sub2">${recvLbl}</div></div>
-      ${["accounts_manager", "senior_accountant"].includes(role) ? `<div class="stat accent"><div class="lab">Completed Requests</div><div class="val">${money(totalPaid)}</div><div class="sub2">${money(totalApproved)} in active / released requests</div></div>` : ""}
-      <div class="stat blue"><div class="lab">Balance In Hand</div><div class="val" style="color:${balance >= 0 ? "var(--green)" : "var(--red)"}">${money(balance)}</div><div class="sub2">${balSub}</div></div>
-      ${!["accounts_manager", "senior_accountant"].includes(role) ? `<div class="stat amber"><div class="lab">In Review</div><div class="val">${inReview}</div><div class="sub2">active queries</div></div>` : ""}
+      ${role === "accounts_manager" ? `
+        <div class="stat accent"><div class="lab">Total Approved</div><div class="val">${money(totalApproved)}</div><div class="sub2">printed, released, or completed requests</div></div>
+        <div class="stat green"><div class="lab">Total Paid</div><div class="val">${money(totalPaid)}</div><div class="sub2">completed fund requests</div></div>
+        <div class="stat blue"><div class="lab">Balance In Hand</div><div class="val" style="color:${accountsManagerBalance >= 0 ? "var(--green)" : "var(--red)"}">${money(accountsManagerBalance)}</div><div class="sub2">${money(totalPaid)} paid − ${money(totalApproved)} approved</div></div>
+      ` : `
+        <div class="stat green"><div class="lab">Funds Received</div><div class="val">${money(given)}</div><div class="sub2">${recvLbl}</div></div>
+        ${role === "senior_accountant" ? `<div class="stat accent"><div class="lab">Completed Requests</div><div class="val">${money(totalPaid)}</div><div class="sub2">${money(totalApproved)} in active / released requests</div></div>` : ""}
+        <div class="stat blue"><div class="lab">Balance In Hand</div><div class="val" style="color:${balance >= 0 ? "var(--green)" : "var(--red)"}">${money(balance)}</div><div class="sub2">${balSub}</div></div>
+        ${role !== "senior_accountant" ? `<div class="stat amber"><div class="lab">In Review</div><div class="val">${inReview}</div><div class="sub2">active queries</div></div>` : ""}
+      `}
     </div>
     <div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>Pending Vouchers</h3><div class="csub" style="margin:0">Not yet approved · queries shown first</div></div><button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="go('expenses')">View all →</button></div>${expenseTable(pending)}</div>`;
   if (can.create())
@@ -3075,7 +3082,7 @@ Views._printFundRequest = async function (id) {
                 <div class="signature-line"></div>
 
                 <div class="signature-name">
-                  Senior Accountant
+                  Managing Director Sir
                 </div>
 
               </div>
@@ -3086,7 +3093,7 @@ Views._printFundRequest = async function (id) {
                 <div class="signature-line"></div>
 
                 <div class="signature-name">
-                  Site Accounts User
+                  Hon. Chairman Sir
                 </div>
 
               </div>
