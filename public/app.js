@@ -1249,6 +1249,14 @@ Views.allFundRequests = async function () {
               >
                 View
               </button>
+              ${["admin", "accounts_manager"].includes(S.user.role) && r.status === "Completed" ? `
+                <button
+                  class="btn btn-ghost btn-sm"
+                  onclick="Views._printFundRequest('${esc(r.id)}')"
+                >
+                  Print
+                </button>
+              ` : ""}
             </td>
           </tr>
         `,
@@ -1837,9 +1845,9 @@ Views._openFundRequest = async function (id) {
             margin-top:18px;
           "
         >
-          ${["senior_accountant", "admin"].includes(S.user.role) && ["Requested", "Printed"].includes(r.status) ? `
+          ${(["senior_accountant", "admin"].includes(S.user.role) && ["Requested", "Printed"].includes(r.status)) || (["admin", "accounts_manager"].includes(S.user.role) && r.status === "Completed") ? `
             <button class="btn btn-ghost" onclick="Views._printFundRequest('${esc(r.id)}')">Print Request</button>
-            ${r.status === "Requested" ? `<button class="btn btn-primary" onclick="Views._markFundRequestPrinted('${esc(r.id)}')">Mark Request Printed</button>` : ""}
+            ${["senior_accountant", "admin"].includes(S.user.role) && r.status === "Requested" ? `<button class="btn btn-primary" onclick="Views._markFundRequestPrinted('${esc(r.id)}')">Mark Request Printed</button>` : ""}
           ` : ""}
 
           <button
@@ -1889,6 +1897,7 @@ Views._printFundRequest = async function (id) {
     const accountsReviewers = new Set();
     const purchaseReviewers = new Set();
     const operationsReviewers = new Set();
+    const GeneralManagers = new Set();
 
     items.forEach((e) => {
       const names = e.approvalNames || {};
@@ -1904,6 +1913,10 @@ Views._printFundRequest = async function (id) {
       if (names.operations) {
         operationsReviewers.add(names.operations);
       }
+
+      if (names.general_manager) {
+        GeneralManagers.add(names.general_manager);
+      }
     });
 
     const accountsReviewerName =
@@ -1913,6 +1926,9 @@ Views._printFundRequest = async function (id) {
       Array.from(purchaseReviewers).join(", ") || "—";
 
     const operationsReviewerName =
+      Array.from(operationsReviewers).join(", ") || "—";
+    
+    const GeneralManagerName =
       Array.from(operationsReviewers).join(", ") || "—";
 
     /*
@@ -2875,7 +2891,7 @@ Views._printFundRequest = async function (id) {
           <div class="from-block">
             <div>
               <strong>From:</strong>
-              Senior Accountant
+              ${esc(r.site_user_name || "Site Accounts user")}
             </div>
           </div>
 
@@ -2961,7 +2977,7 @@ Views._printFundRequest = async function (id) {
 
             <div>
               <strong>Paid From:</strong>
-              SiteRoad
+              Bank Of Maharashtra.
             </div>
 
             <div>
@@ -2981,6 +2997,21 @@ Views._printFundRequest = async function (id) {
             </div>
 
             <div class="digital-signatures">
+
+            <!-- GM -->
+              <div class="digital-signature-box">
+                <div class="digital-signature-status">
+                  DIGITALLY VERIFIED
+                </div>
+
+                <div class="digital-signature-name">
+                  ${esc(GeneralManagerName || "—")}
+                </div>
+
+                <div class="digital-signature-role">
+                  General Manager 
+                </div>
+              </div>
 
               <!-- PURCHASE -->
               <div class="digital-signature-box">
@@ -3009,7 +3040,7 @@ Views._printFundRequest = async function (id) {
                 </div>
 
                 <div class="digital-signature-role">
-                  Senior Accountant
+                  Assistant Manager
                 </div>
               </div>
 
@@ -3029,21 +3060,6 @@ Views._printFundRequest = async function (id) {
                 </div>
               </div>
 
-
-              <!-- REQUEST OWNER -->
-              <div class="digital-signature-box">
-                <div class="digital-signature-status">
-                  DIGITALLY VERIFIED
-                </div>
-
-                <div class="digital-signature-name">
-                  ${esc(adminName || "—")}
-                </div>
-
-                <div class="digital-signature-role">
-                  Fund Request Prepared By · Senior Accountant
-                </div>
-              </div>
 
             </div>
 
