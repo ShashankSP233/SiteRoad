@@ -1249,7 +1249,7 @@ Views.allFundRequests = async function () {
               >
                 View
               </button>
-              ${["admin", "accounts_manager"].includes(S.user.role) && r.status === "Completed" ? `
+              ${["admin", "accounts_manager"].includes(S.user.role) ? `
                 <button
                   class="btn btn-ghost btn-sm"
                   onclick="Views._printFundRequest('${esc(r.id)}')"
@@ -1845,7 +1845,7 @@ Views._openFundRequest = async function (id) {
             margin-top:18px;
           "
         >
-          ${(["senior_accountant", "admin"].includes(S.user.role) && ["Requested", "Printed"].includes(r.status)) || (["admin", "accounts_manager"].includes(S.user.role) && r.status === "Completed") ? `
+          ${(["senior_accountant", "admin"].includes(S.user.role) && ["Requested", "Printed"].includes(r.status)) || ["admin", "accounts_manager"].includes(S.user.role) ? `
             <button class="btn btn-ghost" onclick="Views._printFundRequest('${esc(r.id)}')">Print Request</button>
             ${["senior_accountant", "admin"].includes(S.user.role) && r.status === "Requested" ? `<button class="btn btn-primary" onclick="Views._markFundRequestPrinted('${esc(r.id)}')">Mark Request Printed</button>` : ""}
           ` : ""}
