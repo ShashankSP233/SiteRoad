@@ -1929,7 +1929,7 @@ Views._printFundRequest = async function (id) {
       Array.from(operationsReviewers).join(", ") || "—";
     
     const GeneralManagerName =
-      Array.from(operationsReviewers).join(", ") || "—";
+      Array.from(GeneralManagers).join(", ") || "—";
 
     /*
      * The Admin is the person who created the fund request.

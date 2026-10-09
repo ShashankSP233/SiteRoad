@@ -1427,6 +1427,11 @@ router.get(
           m.usr[e.created_by] || '',
 
         approvalNames: {
+          general_manager:
+            approvals.check?.by
+              ? m.usr[approvals.check.by] || ''
+              : '',
+
           accounts:
             approvals.accounts?.by
               ? m.usr[approvals.accounts.by] || ''
