@@ -11,10 +11,14 @@ the single-file browser prototype could never overcome.
 - **Front-end:** mobile-first single-page app in `public/` (works great on Android browsers)
 
 ## What it enforces (server-side, can't be bypassed)
-- **Project-wise + profile-wise access** — each user has a role and either "all projects"
-  (head office) or a list of allowed projects. Site users see only their own vouchers.
-- **Sequential review** — General Manager → Project Director / Incharge → Senior Accountant → Accounts Manager / Head → *Approved*.
-  Stages cannot be skipped or reordered; financial fields are frozen during review.
+- **Project-wise + profile-wise access** — each user has a profile and either "all projects"
+  (head office) or a list of allowed projects. Site Checker access is assigned per project;
+  a user can also be a Site User on one project and a Site Checker on another.
+- **Voucher creation** — limited to Site Users, assigned Site Checkers, and Admins. A
+  Site Checker-created voucher is recorded as checked by that checker.
+- **Sequential review** — Site User → Site Checker → General Manager → Project Director / Incharge
+  → Senior Accountant → Accounts Manager / Head → *Approved*. Stages cannot be skipped or
+  reordered; financial fields are frozen during review.
 - **SiteRoad funds** — Senior Accountant creates and prints fund requests for a specific Site Accounts user. Accounts Manager / Head releases them; the assigned Site Accounts user confirms receipt, which then increases their usable balance.
 - **Queries, rejections, full audit log, CSV export.**
 

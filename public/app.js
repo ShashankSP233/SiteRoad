@@ -120,6 +120,7 @@ function toast(msg, type) {
 const ROLES = {
   admin: "Administrator",
   site_accounts: "Site Accounts",
+  site_checker: "Site Checker",
   general_manager: "General Manager",
   project_director: "Project Director / Incharge",
   senior_accountant: "Senior Accountant",
@@ -130,9 +131,10 @@ const PILL = {
   Draft: "p-draft",
   Submitted: "p-sub",
   Checked: "p-chk",
-  "Purchase Reviewed": "p-pur",
-  "Operations Reviewed": "p-ops",
-  "Accounts Reviewed": "p-acc",
+  "GM Reviewed": "p-chk",
+  "Project Director Reviewed": "p-pur",
+  "Senior Accountant Reviewed": "p-ops",
+  "Account Manager Reviewed": "p-acc",
   Approved: "p-app",
   "Payment Approved": "p-app",
   Printed: "p-app",
@@ -229,18 +231,18 @@ async function boot() {
   $("#login").classList.add("hide");
   $("#app").classList.remove("hide");
   $("#who").innerHTML =
-    `<div class="nm">${esc(S.user.name)}</div><div class="rl">${ROLES[S.user.role]}</div><div class="logout" onclick="UsersAdmin.changePassword()">Change Password</div><div class="logout" onclick="logout()">⎋ Sign out</div>`;
+    `<div class="nm">${esc(S.user.name)}</div><div class="rl">${ROLES[S.user.role]}${S.user.role !== "site_checker" && S.user.projectCheckerIds?.length ? " · Site Checker" : ""}</div><div class="logout" onclick="UsersAdmin.changePassword()">Change Password</div><div class="logout" onclick="logout()">⎋ Sign out</div>`;
   await buildNav();
   go(S.page);
 }
 
 /* ============ navigation ============ */
 const can = {
-  create: () => ["site_accounts", "general_manager", "admin"].includes(S.user.role),
+  create: () => ["site_accounts", "admin"].includes(S.user.role) || (S.user.projectCheckerIds || []).length > 0,
   review: () =>
-    ["general_manager", "project_director", "senior_accountant", "accounts_manager", "account_checker", "admin"].includes(
+      ["general_manager", "project_director", "senior_accountant", "accounts_manager", "account_checker", "admin"].includes(
       S.user.role,
-    ),
+    ) || (S.user.projectCheckerIds || []).length > 0,
   admin: () => S.user.role === "admin",
   accountCheckers: () => ["accounts_manager", "admin"].includes(S.user.role),
   audit: () => S.user.role === "admin",
@@ -259,33 +261,21 @@ const can = {
   funds: () => ["site_accounts", "general_manager", "senior_accountant", "accounts_manager", "admin"].includes(S.user.role),
   reports: () =>
     ["accounts_manager", "admin"].includes(S.user.role),
-  reviewTab: () => can.review() && S.user.role !== "general_manager",
+  reviewTab: () => can.review() && (S.user.role !== "general_manager" || (S.user.projectCheckerIds || []).length > 0),
   reviewOnly: () => ["project_director", "senior_accountant"].includes(S.user.role),
 };
 
 function pendingForMe(list) {
   const r = S.user.role;
-  if (r === "general_manager") return list.filter((e) => e.status === "Submitted");
-  if (r === "project_director") return list.filter((e) => e.status === "Checked");
-  if (r === "senior_accountant")
-    return list.filter((e) => e.status === "Purchase Reviewed");
-  if (r === "accounts_manager")
-    return list.filter((e) =>
-      ["Operations Reviewed", "Accounts Reviewed"].includes(e.status),
-    );
-  if (r === "account_checker")
-    return list.filter((e) => e.status === "Operations Reviewed");
-  if (r === "admin")
-    return list.filter((e) =>
-      [
-        "Submitted",
-        "Checked",
-        "Purchase Reviewed",
-        "Operations Reviewed",
-        "Accounts Reviewed",
-      ].includes(e.status),
-    );
-  return [];
+  const projectCheckPending = (e) => e.status === "Submitted" && (S.user.projectCheckerIds || []).includes(e.project_id);
+  const projectCheckerItems = list.filter(projectCheckPending);
+  if (r === "general_manager") return [...projectCheckerItems, ...list.filter((e) => e.status === "Checked")];
+  if (r === "project_director") return [...projectCheckerItems, ...list.filter((e) => e.status === "GM Reviewed")];
+  if (r === "senior_accountant") return [...projectCheckerItems, ...list.filter((e) => e.status === "Project Director Reviewed")];
+  if (r === "accounts_manager") return [...projectCheckerItems, ...list.filter((e) => ["Senior Accountant Reviewed", "Account Manager Reviewed"].includes(e.status))];
+  if (r === "account_checker") return [...projectCheckerItems, ...list.filter((e) => e.status === "Senior Accountant Reviewed")];
+  if (r === "admin") return list.filter((e) => ["Submitted", "Checked", "GM Reviewed", "Project Director Reviewed", "Senior Accountant Reviewed", "Account Manager Reviewed"].includes(e.status));
+  return projectCheckerItems;
 }
 async function buildNav() {
   let pend = 0;
@@ -527,7 +517,7 @@ function expenseTable(rows, opts) {
   opts = opts || {};
   const showReviewActions = opts.reviewActions === true;
   if (!rows.length) return '<div class="empty">No matching expenses.</div>';
-  return `<div class="table-wrap"><table><thead><tr><th>Voucher</th><th>Date</th><th>Details</th><th>Site Accounts User</th><th>Category</th><th>Project</th><th class="num">Amount</th><th>Status</th>${showReviewActions ? "<th>Actions</th>" : ""}</tr></thead><tbody>${rows.map((e) => `<tr class="click" onclick="Detail.open('${e.id}')"><td class="mono">${esc(e.voucher_no)}</td><td>${fmtDate(e.date)}</td><td>${esc((e.details || "").slice(0, 42))}${(e.details || "").length > 42 ? "…" : ""} ${e.evidenceCount ? `<span class="tag">📎${e.evidenceCount}</span>` : ""}${e.status === "Paid" ? ' <span class="tag">💰 Receipt confirmed</span>' : e.paid ? ' <span class="tag">Paid at entry</span>' : ""} ${previousDelayBadge(e)} ${overallSlaBadge(e)} ${slaBadge(e)}</td><td>${esc(e.siteUserName || e.createdByName || "—")}</td><td><span class="tag">${esc(e.categoryName)}</span></td><td>${esc(e.projectCode)}</td><td class="num">${money(e.amount)}</td><td>${pill(e.status)}</td>${showReviewActions ? `<td>${e.status === "Accounts Reviewed" ? `<div class="queue-actions" onclick="event.stopPropagation()"><button class="btn btn-primary btn-sm" style="background:var(--green)" onclick="Detail.advance('${e.id}','approve')">Accept</button><button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="Detail.reject('${e.id}')">Reject</button><button class="btn btn-ghost btn-sm" onclick="Detail.raiseQuery('${e.id}')">Query</button></div>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Voucher</th><th>Date</th><th>Details</th><th>Site Accounts User</th><th>Category</th><th>Project</th><th class="num">Amount</th><th>Status</th>${showReviewActions ? "<th>Actions</th>" : ""}</tr></thead><tbody>${rows.map((e) => `<tr class="click" onclick="Detail.open('${e.id}')"><td class="mono">${esc(e.voucher_no)}</td><td>${fmtDate(e.date)}</td><td>${esc((e.details || "").slice(0, 42))}${(e.details || "").length > 42 ? "…" : ""} ${e.evidenceCount ? `<span class="tag">📎${e.evidenceCount}</span>` : ""}${e.status === "Paid" ? ' <span class="tag">💰 Receipt confirmed</span>' : e.paid ? ' <span class="tag">Paid at entry</span>' : ""} ${previousDelayBadge(e)} ${overallSlaBadge(e)} ${slaBadge(e)}</td><td>${esc(e.siteUserName || e.createdByName || "—")}</td><td><span class="tag">${esc(e.categoryName)}</span></td><td>${esc(e.projectCode)}</td><td class="num">${money(e.amount)}</td><td>${pill(e.status)}</td>${showReviewActions ? `<td>${e.status === "Account Manager Reviewed" ? `<div class="queue-actions" onclick="event.stopPropagation()"><button class="btn btn-primary btn-sm" style="background:var(--green)" onclick="Detail.advance('${e.id}','approve')">Accept</button><button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="Detail.reject('${e.id}')">Reject</button><button class="btn btn-ghost btn-sm" onclick="Detail.raiseQuery('${e.id}')">Query</button></div>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
 }
 
 /* ============ views ============ */
@@ -841,7 +831,7 @@ Views.payments = async function () {
 Views.downloadVouchers = async function () {
   const ex = await api("GET", "/expenses");
   Views._downloadVouchers = ex.filter((e) =>
-    ["Accounts Reviewed", "Approved", "Payment Approved", "Paid"].includes(e.status),
+    ["Account Manager Reviewed", "Approved", "Payment Approved", "Paid"].includes(e.status),
   );
 
   const projects = [
@@ -3369,9 +3359,11 @@ Views.review = async function () {
   const rows = pendingForMe(await api("GET", "/expenses"));
   const hint =
     {
-      general_manager: "Submitted items awaiting your review.",
-      project_director: "Checked items awaiting Project Director / Incharge review.",
-      senior_accountant: "Purchase-reviewed items awaiting Senior Accountant review.",
+      site_accounts: "Submitted items awaiting Site Checker review.",
+      site_checker: "Submitted items awaiting your Site Checker review.",
+      general_manager: "Checked items awaiting your review.",
+      project_director: "GM-reviewed items awaiting Project Director / Incharge review.",
+      senior_accountant: "Project Director-reviewed items awaiting Senior Accountant review.",
       accounts_manager: "Items awaiting Accounts Manager / Head review and approval.",
       account_checker: "Items awaiting Level 4 accounts review.",
       admin: "All items in the review pipeline.",
@@ -3455,7 +3447,7 @@ Views.users = async function () {
   Views._users = users;
   $("#content").innerHTML =
     `<div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>User Accounts</h3><div class="csub" style="margin:0">${users.length} users</div></div><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="UsersAdmin.edit()">+ Create User</button></div>
-    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Profile</th><th>Project Access</th><th>Status</th><th></th></tr></thead><tbody>${users.map((u) => `<tr><td><b>${esc(u.name)}</b></td><td class="mono">${esc(u.username)}</td><td><span class="tag">${ROLES[u.role]}</span></td><td>${u.all_projects ? '<span class="tag" style="background:var(--accent-soft);color:var(--accent-d)">All</span>' : u.project_ids.length ? u.project_ids.map((id) => `<span class="tag">${esc((S.allProjects.find((p) => p.id === id) || {}).code || "?")}</span>`).join(" ") : '<span class="tag">none</span>'}</td><td>${u.active ? '<span class="pill p-app">Active</span>' : '<span class="pill p-rej">Disabled</span>'}</td><td style="text-align:right"><button class="btn btn-ghost btn-sm" onclick="UsersAdmin.edit('${u.id}')">Edit</button>${u.id !== S.user.id ? `<button class="btn btn-ghost btn-sm" onclick="UsersAdmin.toggle('${u.id}')">${u.active ? "Disable" : "Enable"}</button>` : '<span class="tag">you</span>'}</td></tr>`).join("")}</tbody></table></div></div>`;
+    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Profile</th><th>Project Access</th><th>Status</th><th></th></tr></thead><tbody>${users.map((u) => `<tr><td><b>${esc(u.name)}</b></td><td class="mono">${esc(u.username)}</td><td><span class="tag">${ROLES[u.role]}</span>${u.project_checker_ids.length ? `<div class="csub">Site Checker: ${u.project_checker_ids.map((id) => esc((S.allProjects.find((p) => p.id === id) || {}).code || "?")).join(", ")}</div>` : ""}</td><td>${u.all_projects ? '<span class="tag" style="background:var(--accent-soft);color:var(--accent-d)">All</span>' : u.project_ids.length ? u.project_ids.map((id) => `<span class="tag">${esc((S.allProjects.find((p) => p.id === id) || {}).code || "?")}</span>`).join(" ") : '<span class="tag">none</span>'}</td><td>${u.active ? '<span class="pill p-app">Active</span>' : '<span class="pill p-rej">Disabled</span>'}</td><td style="text-align:right"><button class="btn btn-ghost btn-sm" onclick="UsersAdmin.edit('${u.id}')">Edit</button>${u.id !== S.user.id ? `<button class="btn btn-ghost btn-sm" onclick="UsersAdmin.toggle('${u.id}')">${u.active ? "Disable" : "Enable"}</button>` : '<span class="tag">you</span>'}</td></tr>`).join("")}</tbody></table></div></div>`;
 };
 
 Views.accountCheckers = async function () {
@@ -3651,7 +3643,8 @@ const ExpenseForm = {
       prj = S.projects,
       loc = S.locations;
     const siteUsers = S.users.filter((u) => u.role === "site_accounts" && u.active);
-    const needsOwnerSelection = ["general_manager", "admin"].includes(S.user.role);
+    const needsOwnerSelection = S.user.role !== "site_accounts" || (S.user.projectCheckerIds || []).some((id) => !S.user.allProjects && !(S.user.projectIds || []).includes(id));
+    const dateLimit = S.user.role !== "admin" && (S.user.role === "site_accounts" || (S.user.projectCheckerIds || []).length > 0);
     const opt = (arr, lab) =>
       arr
         .map((x) => `<option value="${x.id}">${esc(lab(x))}</option>`)
@@ -3659,7 +3652,7 @@ const ExpenseForm = {
     Modal.open(`<div class="modal-head"><h3>New Expense Entry</h3><button class="x" onclick="Modal.close()">×</button></div>
       <div class="modal-body">
         <div class="frow three">
-          <div class="field"><label>Date *</label><input type="date" id="ef-date" value="${new Date().toISOString().slice(0, 10)}"${["site_accounts", "general_manager"].includes(S.user.role) ? ` min="${new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)}"` : ""}></div>
+          <div class="field"><label>Date *</label><input type="date" id="ef-date" value="${new Date().toISOString().slice(0, 10)}"${dateLimit ? ` min="${new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)}"` : ""}></div>
           <div class="field"><label>Amount (₹) *</label><input type="number" id="ef-amt" step="0.01" min="0" placeholder="0.00"></div>
           <div class="field"><label>Category *</label><select id="ef-cat">${opt(cats, (x) => x.name)}</select></div>
         </div>
@@ -3835,7 +3828,7 @@ const ExpenseForm = {
       $("#ef-billno").focus();
       return;
     }
-    if (["general_manager", "admin"].includes(S.user.role) && !$("#ef-site-user")?.value) {
+    if ($("#ef-site-user") && !$("#ef-site-user").value) {
       toast("Select the Site Accounts user responsible for this expense", "err");
       return;
     }
@@ -3920,29 +3913,31 @@ const Detail = {
   ladder(e) {
     const ap = e.approvals || {};
     const steps = [
-      ["check", "Level 1 — Checked"],
-      ["purchase", "Level 2 — Project Director / Incharge Review"],
-      ["operations", "Level 3 — Senior Accountant Review"],
-      ["accounts", "Level 4 — Accounts Manager / Head Review"],
+      ["project_check", "Level 1 — Site Checker"],
+      ["check", "Level 2 — General Manager Review"],
+      ["purchase", "Level 3 — Project Director Reviewed"],
+      ["operations", "Level 4 — Senior Accountant Reviewed"],
+      ["accounts", "Level 5 — Account Manager Reviewed"],
       ["approved", "Final — Approved"],
     ];
     const nowMap = {
-      Submitted: "check",
-      Checked: "purchase",
-      "Purchase Reviewed": "operations",
-      "Operations Reviewed": "accounts",
-      "Accounts Reviewed": "approved",
+      Submitted: "project_check",
+      Checked: "check",
+      "GM Reviewed": "purchase",
+      "Project Director Reviewed": "operations",
+      "Senior Accountant Reviewed": "accounts",
+      "Account Manager Reviewed": "approved",
     };
     return steps
       .map(([k, label], i) => {
         const a = ap[k];
         let cls = "wait",
-          mark = i < 4 ? i + 1 : "✓",
+          mark = i < 5 ? i + 1 : "✓",
           meta = "Awaiting";
         if (a) {
           cls = "done";
           mark = "✓";
-          meta = userName(a.by) + " · " + fmtDT(a.at);
+          meta = a.skipped ? (a.reason || "Skipped") : userName(a.by) + " · " + fmtDT(a.at);
         } else if (nowMap[e.status] === k) {
           cls = "now";
           meta = "Pending now";
@@ -3955,27 +3950,33 @@ const Detail = {
     const r = S.user.role,
       a = [],
       s = e.status,
-      admin = r === "admin";
-    if (s === "Submitted" && (r === "general_manager" || admin))
+      admin = r === "admin",
+      projectChecker = (S.user.projectCheckerIds || []).includes(e.project_id),
+      canReviewThisStage = ["general_manager", "project_director", "senior_accountant", "accounts_manager", "account_checker", "admin"].includes(r) || (s === "Submitted" && projectChecker);
+    if (s === "Submitted" && (projectChecker || admin))
       a.push(
-        `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','check')">✓ Mark Checked</button>`,
+        `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','project_check')">✓ Mark Checked</button>`,
       );
-    if (s === "Checked" && (r === "project_director" || admin))
+    if (s === "Checked" && (r === "general_manager" || admin))
+      a.push(
+        `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','check')">✓ Review (General Manager)</button>`,
+      );
+    if (s === "GM Reviewed" && (r === "project_director" || admin))
       a.push(
         `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','purchase')">✓ Review (Project Director / Incharge)</button>`,
       );
-    if (s === "Purchase Reviewed" && (r === "senior_accountant" || admin))
+    if (s === "Project Director Reviewed" && (r === "senior_accountant" || admin))
       a.push(
         `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','operations')">✓ Review (Senior Accountant)</button>`,
       );
     if (
-      s === "Operations Reviewed" &&
+      s === "Senior Accountant Reviewed" &&
       (["accounts_manager", "account_checker"].includes(r) || admin)
     )
       a.push(
         `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','accounts')">✓ Review (Accounts Manager / Head)</button>`,
       );
-    if (s === "Accounts Reviewed" && (r === "accounts_manager" || admin))
+    if (s === "Account Manager Reviewed" && (r === "accounts_manager" || admin))
       a.push(
         `<button class="btn btn-primary btn-sm" style="background:var(--green)" onclick="Detail.advance('${e.id}','approve')">✓ Approve</button>`,
       );
@@ -3983,11 +3984,12 @@ const Detail = {
       [
         "Submitted",
         "Checked",
-        "Purchase Reviewed",
-        "Operations Reviewed",
-        "Accounts Reviewed",
+        "GM Reviewed",
+        "Project Director Reviewed",
+        "Senior Accountant Reviewed",
+        "Account Manager Reviewed",
       ].includes(s) &&
-      can.review()
+      canReviewThisStage
     ) {
       a.push(
         `<button class="btn btn-ghost btn-sm" onclick="Detail.raiseQuery('${e.id}')">? Raise Query</button>`,
@@ -3997,8 +3999,8 @@ const Detail = {
       );
     }
     if (
-      r === "site_accounts" &&
-      (e.created_by === S.user.id || e.site_user_id === S.user.id) &&
+      ((r === "site_accounts" && (e.created_by === S.user.id || e.site_user_id === S.user.id)) ||
+        (projectChecker && e.created_by === S.user.id)) &&
       ["Draft", "Submitted", "Query"].includes(s)
     )
       a.push(
@@ -4230,6 +4232,10 @@ const UsersAdmin = {
           `<span class="chip ${u && !u.all_projects && u.project_ids.includes(p.id) ? "on" : ""}" data-pid="${p.id}" onclick="this.classList.toggle('on')">${esc(p.code)} · ${esc(p.name)}</span>`,
       )
       .join("");
+    const checkerChips = S.allProjects
+      .filter((p) => p.active)
+      .map((p) => `<span class="chip ${u && (u.project_checker_ids || []).includes(p.id) ? "on" : ""}" data-pid="${p.id}" onclick="this.classList.toggle('on')">${esc(p.code)} · ${esc(p.name)}</span>`)
+      .join("");
     const allOn = u ? u.all_projects : false;
     Modal.open(`<div class="modal-head"><h3>${u ? "Edit User" : "Create User"}</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body">
       <div class="frow"><div class="field"><label>Full name *</label><input id="us-name" value="${esc(u ? u.name : "")}"></div><div class="field"><label>Username *</label><input id="us-user" value="${esc(u ? u.username : "")}"></div></div>
@@ -4244,6 +4250,7 @@ const UsersAdmin = {
           "",
         )}</select></div><div class="field"><label>${u ? "Reset password" : "Password *"}</label><input id="us-pass" type="text" placeholder="${u ? "leave blank to keep" : "set a password"}"></div></div>
       <div class="field full"><label>Project access</label><label style="display:flex;gap:8px;align-items:center;text-transform:none;letter-spacing:0;color:var(--ink);margin:4px 0 8px"><input type="checkbox" id="us-all" ${allOn ? "checked" : ""} onchange="$('#us-chips').style.opacity=this.checked?.4:1;$('#us-chips').style.pointerEvents=this.checked?'none':'auto'"> All projects (head office)</label><div class="chips" id="us-chips" style="${allOn ? "opacity:.4;pointer-events:none" : ""}">${chips}</div></div>
+      <div class="field full"><label>Site Checker access</label><div class="chips" id="us-checker-chips">${checkerChips}</div></div>
     </div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="UsersAdmin.save(${u ? `'${u.id}'` : "null"})">Save</button></div>`);
   },
   async save(id) {
@@ -4256,6 +4263,7 @@ const UsersAdmin = {
       projectIds: allProjects
         ? []
         : $$("#us-chips .chip.on").map((c) => c.dataset.pid),
+      checkerProjectIds: $$("#us-checker-chips .chip.on").map((c) => c.dataset.pid),
     };
     const pass = $("#us-pass").value;
     if (pass) body.password = pass;

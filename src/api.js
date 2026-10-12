@@ -9,7 +9,7 @@ const { db, uid, now, loadUser, scopeOf, nextVoucher, nextFundRequest, logAudit,
 
 const router = express.Router();
 const USER_ROLES = new Set([
-  'admin', 'site_accounts', 'general_manager', 'project_director',
+  'admin', 'site_accounts', 'site_checker', 'general_manager', 'project_director',
   'senior_accountant', 'accounts_manager', 'account_checker',
 ]);
 const UP_DIR = path.join(__dirname, '..', 'uploads');
@@ -55,20 +55,29 @@ function scopeClause(user, alias = 'e') {
     }
   }
   if (user.role === 'site_accounts') {
-    clauses.push(`(${alias}.created_by = ? OR ${alias}.site_user_id = ?)`);
-    params.push(user.id, user.id);
+    const checkerIds = user.project_checker_ids || [];
+    if (checkerIds.length) {
+      clauses.push(`(${alias}.project_id IN (${checkerIds.map(() => '?').join(',')}) OR (${alias}.created_by = ? OR ${alias}.site_user_id = ?))`);
+      params.push(...checkerIds, user.id, user.id);
+    } else {
+      clauses.push(`(${alias}.created_by = ? OR ${alias}.site_user_id = ?)`);
+      params.push(user.id, user.id);
+    }
   }
   return { where: clauses.length ? ' AND ' + clauses.join(' AND ') : '', params };
 }
 function canSeeExpense(user, exp) {
   const s = scopeOf(user);
   if (!s.all && !s.ids.includes(exp.project_id)) return false;
-  if (user.role === 'site_accounts' && exp.created_by !== user.id && exp.site_user_id !== user.id) return false;
+  if (user.role === 'site_accounts' && !(user.project_checker_ids || []).includes(exp.project_id) && exp.created_by !== user.id && exp.site_user_id !== user.id) return false;
   return true;
 }
 function inScope(user, projectId) {
   const s = scopeOf(user);
   return s.all || s.ids.includes(projectId);
+}
+function hasProjectChecker(user, projectId) {
+  return (user.project_checker_ids || []).includes(projectId);
 }
 
 // ---------------------------------------------------------------- lookups for display
@@ -123,7 +132,7 @@ async function computeSla(e) {
     };
 
   } else if (
-    ['Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed']
+    ['Checked', 'GM Reviewed', 'Project Director Reviewed', 'Senior Accountant Reviewed', 'Account Manager Reviewed']
       .includes(e.status)
   ) {
     const ap = JSON.parse(e.approvals || '{}');
@@ -132,10 +141,11 @@ async function computeSla(e) {
     // The previous completed step's timestamp is therefore
     // the timestamp at which the current step was received.
     const anchors = {
-      Checked: ap.check && ap.check.at,
-      'Purchase Reviewed': ap.purchase && ap.purchase.at,
-      'Operations Reviewed': ap.operations && ap.operations.at,
-      'Accounts Reviewed': ap.accounts && ap.accounts.at
+      Checked: ap.project_check && ap.project_check.at,
+      'GM Reviewed': ap.check && ap.check.at,
+      'Project Director Reviewed': ap.purchase && ap.purchase.at,
+      'Senior Accountant Reviewed': ap.operations && ap.operations.at,
+      'Account Manager Reviewed': ap.accounts && ap.accounts.at
     };
 
     const anchor = anchors[e.status];
@@ -371,6 +381,7 @@ router.get('/bootstrap', async (req, res) => {
     user: {
       id: u.id, name: u.name, username: u.username, role: u.role,
       allProjects: u.all_projects, projectIds: u.project_ids,
+      projectCheckerIds: u.project_checker_ids,
     },
     projects: activeProjects.filter(p => inScope(u, p.id)),
     allProjects,       // admin views
@@ -381,6 +392,11 @@ router.get('/bootstrap', async (req, res) => {
 });
 
 // ================================================================ EXPENSES
+function requireVoucherCreator(req, res, next) {
+  if (req.user.role === 'admin' || req.user.role === 'site_accounts' || (req.user.project_checker_ids || []).length) return next();
+  return res.status(403).json({ error: 'Only Site Users, assigned Site Checkers, and Admins can create vouchers' });
+}
+
 router.get('/expenses', async (req, res) => {
   const m = await nameMaps();
   const sc = scopeClause(req.user, 'e');
@@ -416,23 +432,30 @@ router.get('/expenses/:id', async (req, res) => {
   res.json({ ...(await decorate(e, m)), evidence, history, queries });
 });
 
-router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts', 'general_manager', 'admin'), async (req, res) => {
+router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), async (req, res) => {
   const b = req.body;
   if (!b.date || !b.amount || !b.details) return res.status(400).json({ error: 'Date, amount and details required' });
+  const siteUserForProject = req.user.role === 'site_accounts' &&
+    (req.user.all_projects || (req.user.project_ids || []).includes(b.projectId));
+  const projectChecker = hasProjectChecker(req.user, b.projectId);
+  const isAdmin = req.user.role === 'admin';
+  if (!siteUserForProject && !projectChecker && !isAdmin) {
+    return res.status(403).json({ error: 'Only Site Users, assigned Site Checkers, and Admins can create vouchers' });
+  }
   const billNo = String(b.billNo || '').trim();
   if (!billNo) return res.status(400).json({ error: 'Bill No. or UPI UTR No. required' });
   const existingBillNo = await findBillNoDuplicate(billNo);
   if (existingBillNo) return res.status(409).json({ error: `Bill No. / UPI UTR No. "${billNo}" is already used on ${existingBillNo.voucher_no}.` });
   if (!inScope(req.user, b.projectId)) return res.status(403).json({ error: 'Project not in your access' });
-  const siteUserId = req.user.role === 'site_accounts' ? req.user.id : String(b.siteUserId || '').trim();
+  const siteUserId = siteUserForProject ? req.user.id : String(b.siteUserId || '').trim();
   if (!siteUserId) return res.status(400).json({ error: 'Select the Site Accounts user responsible for this expense' });
   const siteUser = await loadUser(siteUserId);
   if (!siteUser || siteUser.role !== 'site_accounts' || !siteUser.active) return res.status(400).json({ error: 'Expense owner must be an active Site Accounts user' });
   if (!siteUser.all_projects && !(siteUser.project_ids || []).includes(b.projectId)) return res.status(400).json({ error: 'The selected Site Accounts user is not assigned to this project' });
   const asDraft = b.asDraft === 'true' || b.asDraft === true;
 
-  // P14 -- site/checker cannot enter expenses dated more than 7 days ago
-  if (['site_accounts', 'general_manager'].includes(req.user.role)) {
+  // P14 -- Site Users and Site Checkers cannot enter expenses dated more than 7 days ago.
+  if (!isAdmin && (siteUserForProject || projectChecker)) {
     const dErr = entryDateError(b.date);
     if (dErr) return res.status(400).json({ error: dErr });
   }
@@ -449,11 +472,11 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts'
 
   const id = uid();
   const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId || null);
-  // A General Manager enters expenses directly and is their own checker, so the voucher starts
-  // already "Checked" (workflow begins at Purchase). Everyone else starts at "Submitted".
-  const checkerEntry = req.user.role === 'general_manager';
+  const checkerEntry = projectChecker;
   const status = asDraft ? 'Draft' : (checkerEntry ? 'Checked' : 'Submitted');
-  const approvals = (!asDraft && checkerEntry) ? JSON.stringify({ check: { by: req.user.id, at: now() } }) : '{}';
+  const approvals = (!asDraft && checkerEntry) ? JSON.stringify({
+    project_check: { by: req.user.id, at: now() },
+  }) : '{}';
   // voucher + evidence + history + audit succeed or roll back together
   let voucher;
 
@@ -477,7 +500,9 @@ router.post('/expenses', upload.array('photos', 12), requireRole('site_accounts'
     }
 
     await addHistory(id, req.user.id, asDraft ? 'Created draft' : 'Submitted', 'Voucher created');
+    if (!asDraft && checkerEntry) await addHistory(id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
     await logAudit(req.user, asDraft ? 'Created draft' : 'Submitted expense', 'expense', voucher, '₹' + b.amount);
+    if (!asDraft && checkerEntry) await logAudit(req.user, 'Checked by Site Checker', 'expense', voucher, 'Automatically checked on submission');
   });
     res.json({ id, voucherNo: voucher });
   });
@@ -488,7 +513,9 @@ router.patch('/expenses/:id', async (req, res) => {
   if (!e) return res.status(404).json({ error: 'Not found' });
   const isOwnerEditable = req.user.role === 'site_accounts' && (e.created_by === req.user.id || e.site_user_id === req.user.id) &&
     ['Draft', 'Submitted', 'Query'].includes(e.status);
-  if (!(isOwnerEditable || req.user.role === 'admin')) return res.status(403).json({ error: 'Not editable' });
+  const isCheckerEditable = hasProjectChecker(req.user, e.project_id) && e.created_by === req.user.id &&
+    ['Draft', 'Submitted', 'Query'].includes(e.status);
+  if (!(isOwnerEditable || isCheckerEditable || req.user.role === 'admin')) return res.status(403).json({ error: 'Not editable' });
   const b = req.body;
   const willSubmit = !b.asDraft;
   if (b.billNo != null) {
@@ -498,7 +525,7 @@ router.patch('/expenses/:id', async (req, res) => {
     if (duplicateBillNo) return res.status(409).json({ error: `Bill No. / UPI UTR No. "${billNo}" is already used on ${duplicateBillNo.voucher_no}.` });
   }
   // P14 -- keep the 7-day rule on edits too (site only)
-  if (req.user.role === 'site_accounts' && b.date) {
+  if (req.user.role !== 'admin' && (req.user.role === 'site_accounts' || hasProjectChecker(req.user, e.project_id)) && b.date) {
     const dErr = entryDateError(b.date);
     if (dErr) return res.status(400).json({ error: dErr });
   }
@@ -508,35 +535,43 @@ router.patch('/expenses/:id', async (req, res) => {
     if (evCount.c === 0) return res.status(400).json({ error: 'This voucher has no photo/image attached, so it cannot be submitted. Please attach evidence first.' });
   }
   const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId ?? e.location_id);
+  const checkerSubmission = willSubmit && isCheckerEditable;
+  const nextStatus = b.asDraft ? 'Draft' : (checkerSubmission ? 'Checked' : 'Submitted');
+  const approvals = checkerSubmission ? JSON.stringify({ project_check: { by: req.user.id, at: now() } }) : '{}';
   await db.prepare(`UPDATE expenses SET date=?,amount=?,category_id=?,details=?,location_id=?,
-    expense_done_by=?,bill_received=?,bill_no=?,remark=?,status=?,submitted_at=?,updated_at=? WHERE id=?`).run(
+    expense_done_by=?,bill_received=?,bill_no=?,remark=?,status=?,approvals=?,submitted_at=?,updated_at=? WHERE id=?`).run(
     b.date ?? e.date, b.amount != null ? toPaise(b.amount) : e.amount, b.categoryId ?? e.category_id,
     b.details ?? e.details, locationId, b.expenseDoneBy ?? e.expense_done_by,
     b.billReceived ?? e.bill_received, b.billNo ?? e.bill_no,
-    b.remark ?? e.remark, (b.asDraft ? 'Draft' : 'Submitted'), (willSubmit ? now() : e.submitted_at), now(), e.id);
-  await addHistory(e.id, req.user.id, 'Edited', 'Updated voucher');
+    b.remark ?? e.remark, nextStatus, approvals, (willSubmit ? now() : e.submitted_at), now(), e.id);
+  await addHistory(e.id, req.user.id, checkerSubmission ? 'Submitted' : 'Edited', checkerSubmission ? 'Updated and submitted voucher' : 'Updated voucher');
+  if (checkerSubmission) await addHistory(e.id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
   await logAudit(req.user, 'Edited expense', 'expense', e.voucher_no, '');
+  if (checkerSubmission) await logAudit(req.user, 'Checked by Site Checker', 'expense', e.voucher_no, 'Automatically checked on submission');
   res.json({ ok: true });
 });
 
 // ---- sequential review ladder (server-enforced order) ----
 const FLOW = {
-  check:      { from: 'Submitted',           to: 'Checked',             role: 'general_manager',    key: 'check',      label: 'Checked by General Manager' },
-  purchase:   { from: 'Checked',             to: 'Purchase Reviewed',   role: 'project_director',   key: 'purchase',   label: 'Reviewed by Project Director / Incharge' },
-  operations: { from: 'Purchase Reviewed',   to: 'Operations Reviewed', role: 'senior_accountant', key: 'operations', label: 'Reviewed by Senior Accountant' },
-  accounts:   { from: 'Operations Reviewed', to: 'Accounts Reviewed',   roles: ['accounts_manager', 'account_checker'], key: 'accounts', label: 'Reviewed by Accounts Manager / Head' },
-  approve:    { from: 'Accounts Reviewed',   to: 'Approved',            role: 'accounts_manager',   key: 'approved',   label: 'Approved' },
+  project_check: { from: 'Submitted',        to: 'Checked',             projectChecker: true,       key: 'project_check', label: 'Checked by Site Checker' },
+  check:      { from: 'Checked',              to: 'GM Reviewed',          role: 'general_manager',    key: 'check',      label: 'Reviewed by General Manager' },
+  purchase:   { from: 'GM Reviewed',          to: 'Project Director Reviewed', role: 'project_director', key: 'purchase', label: 'Reviewed by Project Director / Incharge' },
+  operations: { from: 'Project Director Reviewed', to: 'Senior Accountant Reviewed', role: 'senior_accountant', key: 'operations', label: 'Reviewed by Senior Accountant' },
+  accounts:   { from: 'Senior Accountant Reviewed', to: 'Account Manager Reviewed', roles: ['accounts_manager', 'account_checker'], key: 'accounts', label: 'Reviewed by Accounts Manager / Head' },
+  approve:    { from: 'Account Manager Reviewed', to: 'Approved', role: 'accounts_manager', key: 'approved', label: 'Approved' },
 };
 router.post('/expenses/:id/advance/:step', async (req, res) => {
   const step = FLOW[req.params.step];
   if (!step) return res.status(400).json({ error: 'Unknown step' });
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
-  const stepAllowed = step.roles
+  const stepAllowed = step.projectChecker
+    ? hasProjectChecker(req.user, e.project_id)
+    : step.roles
     ? step.roles.includes(req.user.role)
     : req.user.role === step.role;
   if (!stepAllowed && req.user.role !== 'admin')
-    return res.status(403).json({ error: `Only ${step.roles ? step.roles.join(' or ') : step.role} can do this step` });
+    return res.status(403).json({ error: step.projectChecker ? 'Only an assigned Site Checker can do this step' : `Only ${step.roles ? step.roles.join(' or ') : step.role} can do this step` });
   if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
   if (e.status !== step.from)
     return res.status(409).json({ error: `Voucher must be "${step.from}" first (it is "${e.status}")` });
@@ -559,11 +594,14 @@ router.post('/expenses/:id/advance/:step', async (req, res) => {
   res.json({ ok: true, status: step.to });
 });
 
-router.post('/expenses/:id/reject', requireRole('general_manager', 'project_director', 'senior_accountant', 'accounts_manager', 'account_checker', 'admin'), async (req, res) => {
+router.post('/expenses/:id/reject', async (req, res) => {
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
+  const canReject = ['general_manager', 'project_director', 'senior_accountant', 'accounts_manager', 'account_checker', 'admin'].includes(req.user.role) ||
+    (e.status === 'Submitted' && hasProjectChecker(req.user, e.project_id));
+  if (!canReject) return res.status(403).json({ error: 'Not permitted' });
   if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
-  if (!['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(e.status))
+  if (!['Submitted', 'Checked', 'GM Reviewed', 'Project Director Reviewed', 'Senior Accountant Reviewed', 'Account Manager Reviewed'].includes(e.status))
     return res.status(409).json({ error: 'Cannot reject at this stage' });
   const reason = (req.body.reason || '').trim();
   if (!reason) return res.status(400).json({ error: 'Reason required' });
@@ -573,11 +611,14 @@ router.post('/expenses/:id/reject', requireRole('general_manager', 'project_dire
   res.json({ ok: true });
 });
 
-router.post('/expenses/:id/query', requireRole('general_manager', 'project_director', 'senior_accountant', 'accounts_manager', 'account_checker', 'admin'), async (req, res) => {
+router.post('/expenses/:id/query', async (req, res) => {
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
+  const canQuery = ['general_manager', 'project_director', 'senior_accountant', 'accounts_manager', 'account_checker', 'admin'].includes(req.user.role) ||
+    (e.status === 'Submitted' && hasProjectChecker(req.user, e.project_id));
+  if (!canQuery) return res.status(403).json({ error: 'Not permitted' });
   if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
-  if (!['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed'].includes(e.status))
+  if (!['Submitted', 'Checked', 'GM Reviewed', 'Project Director Reviewed', 'Senior Accountant Reviewed', 'Account Manager Reviewed'].includes(e.status))
     return res.status(409).json({ error: `Cannot raise a query while voucher is "${e.status}"` });
   const to = e.site_user_id || e.created_by; // query the Site Accounts owner when a manager entered the voucher
   const text = (req.body.text || '').trim();
@@ -633,15 +674,19 @@ router.post('/queries/:id/resolve', async (req, res) => {
   const stillOpen = await db.prepare("SELECT 1 FROM queries WHERE expense_id=? AND status='Open' LIMIT 1").get(q.expense_id);
   if (!stillOpen && e && e.status === 'Query') {
     // P12/23 -- full ladder reset: once all queries are resolved, the voucher returns to
-    // the start and the whole chain re-approves (checker -> purchase -> operations ->
-    // accounts), regardless of who raised the query or at which stage. History is retained.
+    // the start and the whole chain re-approves (Site Checker -> GM -> Project Director ->
+    // operations -> accounts), regardless of who raised the query or at which stage. History is retained.
     const creator = await loadUser(e.created_by);
-    const checkerVoucher = creator && creator.role === 'general_manager';
-    const resetStatus = checkerVoucher ? 'Checked' : 'Submitted';
-    const resetApprovals = checkerVoucher ? JSON.stringify({ check: { by: e.created_by, at: now() } }) : '{}';
+    const currentApprovals = JSON.parse(e.approvals || '{}');
+    const checkerVoucher = creator && creator.role === 'general_manager' && currentApprovals.project_check && currentApprovals.project_check.skipped;
+    const resetStatus = checkerVoucher ? 'GM Reviewed' : 'Submitted';
+    const resetApprovals = checkerVoucher ? JSON.stringify({
+      project_check: { skipped: true, reason: 'General Manager direct entry' },
+      check: { by: e.created_by, at: now() },
+    }) : '{}';
     await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,submitted_at=?,updated_at=? WHERE id=?")
       .run(resetStatus, resetApprovals, now(), now(), e.id);
-    await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher ? 'Re-opened — re-approval from Project Director / Incharge onward' : 'Re-submitted — full re-approval required (General Manager → Project Director / Incharge → Senior Accountant → Accounts Manager / Head)');
+    await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher ? 'Re-opened — re-approval from Project Director / Incharge onward' : 'Re-submitted — full re-approval required (Site Checker → General Manager → Project Director / Incharge → Senior Accountant → Accounts Manager / Head)');
   }
   await logAudit(req.user, 'Resolved query', 'expense', q.voucher_no, '');
   res.json({ ok: true });
@@ -720,13 +765,15 @@ router.get('/users', requireRole('admin'), async (req, res) => {
   for (const u of users) {
     u.all_projects = !!u.all_projects; u.active = !!u.active;
     u.project_ids = (await db.prepare('SELECT project_id FROM user_projects WHERE user_id=?').all(u.id)).map(r => r.project_id);
+    u.project_checker_ids = (await db.prepare('SELECT project_id FROM project_checkers WHERE user_id=?').all(u.id)).map(r => r.project_id);
   }
   res.json(users);
 });
 router.post('/users', requireRole('admin'), async (req, res) => {
-  const { username, name, role, password, allProjects, projectIds } = req.body;
+  const { username, name, role, password, allProjects, projectIds, checkerProjectIds } = req.body;
   if (!username || !name || !role || !password) return res.status(400).json({ error: 'Missing fields' });
   if (!USER_ROLES.has(role)) return res.status(400).json({ error: 'Select a valid SiteRoad role' });
+  if (role === 'site_checker' && !(checkerProjectIds || []).length) return res.status(400).json({ error: 'Assign at least one project to a Site Checker' });
   if (await db.prepare('SELECT 1 FROM users WHERE username=?').get(username)) return res.status(409).json({ error: 'Username exists' });
   const id = uid();
   await db.prepare('INSERT INTO users (id,username,name,password_hash,role,all_projects,active,created_at) VALUES (?,?,?,?,?,?,1,?)')
@@ -736,14 +783,21 @@ router.post('/users', requireRole('admin'), async (req, res) => {
       await db.prepare('INSERT INTO user_projects (user_id,project_id) VALUES (?,?) ON CONFLICT (user_id,project_id) DO NOTHING').run(id, pid);
     }
   }
+  for (const pid of (checkerProjectIds || [])) {
+    await db.prepare('INSERT INTO project_checkers (user_id,project_id) VALUES (?,?) ON CONFLICT (user_id,project_id) DO NOTHING').run(id, pid);
+  }
   await logAudit(req.user, 'Created user', 'user', username, role);
   res.json({ id });
 });
 router.patch('/users/:id', requireRole('admin'), async (req, res) => {
   const u = await db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
   if (!u) return res.status(404).json({ error: 'Not found' });
-  const { username, name, role, password, allProjects, projectIds } = req.body;
+  const { username, name, role, password, allProjects, projectIds, checkerProjectIds } = req.body;
   if (role && !USER_ROLES.has(role)) return res.status(400).json({ error: 'Select a valid SiteRoad role' });
+  const effectiveCheckerProjects = Array.isArray(checkerProjectIds)
+    ? checkerProjectIds
+    : (await db.prepare('SELECT project_id FROM project_checkers WHERE user_id=?').all(u.id)).map(r => r.project_id);
+  if ((role || u.role) === 'site_checker' && effectiveCheckerProjects.length === 0) return res.status(400).json({ error: 'Assign at least one project to a Site Checker' });
   const newUsername = (username || '').trim();
   if (newUsername && newUsername !== u.username) {
     const clash = await db.prepare('SELECT 1 FROM users WHERE username=? AND id!=?').get(newUsername, u.id);
@@ -756,6 +810,12 @@ router.patch('/users/:id', requireRole('admin'), async (req, res) => {
   if (!allProjects) {
     for (const pid of (projectIds || [])) {
       await db.prepare('INSERT INTO user_projects (user_id,project_id) VALUES (?,?) ON CONFLICT (user_id,project_id) DO NOTHING').run(u.id, pid);
+    }
+  }
+  if (Array.isArray(checkerProjectIds)) {
+    await db.prepare('DELETE FROM project_checkers WHERE user_id=?').run(u.id);
+    for (const pid of checkerProjectIds) {
+      await db.prepare('INSERT INTO project_checkers (user_id,project_id) VALUES (?,?) ON CONFLICT (user_id,project_id) DO NOTHING').run(u.id, pid);
     }
   }
   await logAudit(req.user, 'Edited user', 'user', newUsername || u.username, role || u.role);
@@ -1011,7 +1071,7 @@ router.post('/vouchers/download', requireRole('accounts_manager', 'admin'), asyn
       return res.status(404).json({ error: 'One or more selected vouchers were not found' });
     }
 
-    if (!['Accounts Reviewed', 'Approved', 'Payment Approved', 'Paid'].includes(e.status) || !canSeeExpense(req.user, e)) {
+    if (!['Account Manager Reviewed', 'Approved', 'Payment Approved', 'Paid'].includes(e.status) || !canSeeExpense(req.user, e)) {
       return res.status(403).json({
         error: `Voucher ${e.voucher_no} is not available for download`
       });
@@ -1204,24 +1264,25 @@ router.get('/analytics', requireRole('accounts_manager', 'admin'), async (req, r
   // ---- workflow speed (iterate vouchers once) ----
   const rows = await db.prepare('SELECT id,status,amount,created_by,submitted_at,created_at,approvals,date FROM expenses').all();
   const DAY = 86400000;
-  const acc = { check: { t: 0, n: 0 }, purchase: { t: 0, n: 0 }, operations: { t: 0, n: 0 }, accounts: { t: 0, n: 0 }, approved: { t: 0, n: 0 } };
+  const acc = { project_check: { t: 0, n: 0 }, check: { t: 0, n: 0 }, purchase: { t: 0, n: 0 }, operations: { t: 0, n: 0 }, accounts: { t: 0, n: 0 }, approved: { t: 0, n: 0 } };
   const cleared = {};
   rows.forEach(e => {
     let ap = {}; try { ap = JSON.parse(e.approvals || '{}'); } catch (x) {}
     const anchor = e.submitted_at || e.created_at, at = k => ap[k] && ap[k].at;
-    if (at('check') && anchor) { acc.check.t += at('check') - anchor; acc.check.n++; }
+    if (at('project_check') && !ap.project_check.skipped && anchor) { acc.project_check.t += at('project_check') - anchor; acc.project_check.n++; }
+    if (at('check') && at('project_check')) { acc.check.t += at('check') - at('project_check'); acc.check.n++; }
     if (at('purchase') && at('check')) { acc.purchase.t += at('purchase') - at('check'); acc.purchase.n++; }
     if (at('operations') && at('purchase')) { acc.operations.t += at('operations') - at('purchase'); acc.operations.n++; }
     if (at('accounts') && at('operations')) { acc.accounts.t += at('accounts') - at('operations'); acc.accounts.n++; }
     if (at('approved') && at('accounts')) { acc.approved.t += at('approved') - at('accounts'); acc.approved.n++; }
-    ['check', 'purchase', 'operations', 'accounts', 'approved'].forEach(k => { if (ap[k] && ap[k].by) cleared[ap[k].by] = (cleared[ap[k].by] || 0) + 1; });
+    ['project_check', 'check', 'purchase', 'operations', 'accounts', 'approved'].forEach(k => { if (ap[k] && ap[k].by) cleared[ap[k].by] = (cleared[ap[k].by] || 0) + 1; });
   });
-  const stageLabel = { check: 'Submit → General Manager', purchase: 'General Manager → Project Director / Incharge', operations: 'Project Director / Incharge → Senior Accountant', accounts: 'Senior Accountant → Accounts Manager / Head', approved: 'Accounts Manager / Head → Approved' };
-  const turnaround = ['check', 'purchase', 'operations', 'accounts', 'approved'].map(k => ({ stage: stageLabel[k], avgDays: acc[k].n ? +(acc[k].t / acc[k].n / DAY).toFixed(1) : 0, count: acc[k].n }));
+  const stageLabel = { project_check: 'Submit → Site Checker', check: 'Site Checker → General Manager', purchase: 'General Manager → Project Director / Incharge', operations: 'Project Director / Incharge → Senior Accountant', accounts: 'Senior Accountant → Accounts Manager / Head', approved: 'Accounts Manager / Head → Approved' };
+  const turnaround = ['project_check', 'check', 'purchase', 'operations', 'accounts', 'approved'].map(k => ({ stage: stageLabel[k], avgDays: acc[k].n ? +(acc[k].t / acc[k].n / DAY).toFixed(1) : 0, count: acc[k].n }));
   const throughput = Object.entries(cleared).map(([id, c]) => ({ name: (users[id] || {}).name || '—', role: (users[id] || {}).role || '', cleared: c })).sort((a, b) => b.cleared - a.cleared);
 
   // ---- SLA + aging (pending vouchers) ----
-  const pendingStatuses = ['Submitted', 'Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed', 'Query'];
+  const pendingStatuses = ['Submitted', 'Checked', 'GM Reviewed', 'Project Director Reviewed', 'Senior Accountant Reviewed', 'Account Manager Reviewed', 'Query'];
   let onTrack = 0, overdue = 0; const aging = { '< 2 days': 0, '2–7 days': 0, '> 7 days': 0 };
   for (const e of rows.filter(e => pendingStatuses.includes(e.status))) {
     const sla = await computeSla(e);

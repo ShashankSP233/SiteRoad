@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS user_projects (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS project_checkers (
+  user_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  PRIMARY KEY (user_id, project_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS categories (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
 );
@@ -351,6 +358,48 @@ WHERE fr.id = owners.fund_request_id
 -- now confirm their own assigned fund requests.
 UPDATE users SET active=0 WHERE role='site_accountant' AND active<>0;
 `);
+
+  const migrationName = 'project_checker_workflow_v1';
+  const migration = await db.prepare('SELECT 1 FROM schema_migrations WHERE name=?').get(migrationName);
+  if (!migration) {
+    await db.transaction(async () => {
+      const rows = await db.prepare('SELECT id,status,approvals FROM expenses').all();
+      for (const row of rows) {
+        const approvals = JSON.parse(row.approvals || '{}');
+        const legacyGMReview = approvals.check;
+        const hadPassedGM = ['Checked', 'Purchase Reviewed', 'Operations Reviewed', 'Accounts Reviewed', 'Approved', 'Payment Approved', 'Printed', 'Released', 'Paid', 'Completed'].includes(row.status) || (row.status === 'Query' && !!legacyGMReview);
+        if (!legacyGMReview && !hadPassedGM) continue;
+        if (hadPassedGM) {
+          approvals.project_check = { skipped: true, reason: 'Existing voucher before Site Checker stage' };
+        }
+        const status = row.status === 'Checked' ? 'GM Reviewed' : row.status;
+        await db.prepare('UPDATE expenses SET status=?,approvals=? WHERE id=?')
+          .run(status, JSON.stringify(approvals), row.id);
+      }
+      await db.prepare('INSERT INTO schema_migrations (name,applied_at) VALUES (?,?)')
+        .run(migrationName, now());
+    });
+  }
+
+  const statusMigrationName = 'review_status_names_v1';
+  const statusMigration = await db.prepare('SELECT 1 FROM schema_migrations WHERE name=?').get(statusMigrationName);
+  if (!statusMigration) {
+    await db.transaction(async () => {
+      const renameStatus = `CASE %s
+        WHEN 'Purchase Reviewed' THEN 'Project Director Reviewed'
+        WHEN 'Operations Reviewed' THEN 'Senior Accountant Reviewed'
+        WHEN 'Accounts Reviewed' THEN 'Account Manager Reviewed'
+        ELSE %s
+      END`;
+      await db.prepare(`UPDATE expenses SET status=${renameStatus.replaceAll('%s', 'status')},prev_status=${renameStatus.replaceAll('%s', 'prev_status')}
+        WHERE status IN ('Purchase Reviewed','Operations Reviewed','Accounts Reviewed')
+           OR prev_status IN ('Purchase Reviewed','Operations Reviewed','Accounts Reviewed')`).run();
+      await db.prepare(`UPDATE queries SET prev_status=${renameStatus.replaceAll('%s', 'prev_status')}
+        WHERE prev_status IN ('Purchase Reviewed','Operations Reviewed','Accounts Reviewed')`).run();
+      await db.prepare('INSERT INTO schema_migrations (name,applied_at) VALUES (?,?)')
+        .run(statusMigrationName, now());
+    });
+  }
 }
 
 // ---------------------------------------------------------------- seed
@@ -401,12 +450,13 @@ async function loadUser(id) {
   u.all_projects = !!u.all_projects;
   u.active = !!u.active;
   u.project_ids = (await db.prepare('SELECT project_id FROM user_projects WHERE user_id=?').all(id)).map((r) => r.project_id);
+  u.project_checker_ids = (await db.prepare('SELECT project_id FROM project_checkers WHERE user_id=?').all(id)).map((r) => r.project_id);
   return u;
 }
 
 function scopeOf(user) {
   if (user.all_projects || user.role === 'admin') return { all: true, ids: [] };
-  return { all: false, ids: user.project_ids };
+  return { all: false, ids: [...new Set([...(user.project_ids || []), ...(user.project_checker_ids || [])])] };
 }
 
 async function nextVoucher() {
