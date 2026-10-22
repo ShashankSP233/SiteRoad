@@ -79,6 +79,14 @@ function inScope(user, projectId) {
 function hasProjectChecker(user, projectId) {
   return (user.project_checker_ids || []).includes(projectId);
 }
+const QUERY_ROLES = new Set(USER_ROLES);
+const QUERY_RESOLVER_ROLES = new Set([
+  'site_checker', 'general_manager', 'project_director', 'senior_accountant',
+  'accounts_manager', 'account_checker', 'admin',
+]);
+function inQueryWorkflow(user, expense) {
+  return !!expense && QUERY_ROLES.has(user.role) && canSeeExpense(user, expense);
+}
 
 // ---------------------------------------------------------------- lookups for display
 async function nameMaps() {
@@ -115,7 +123,8 @@ async function computeSla(e) {
 
   } else if (e.status === 'Submitted') {
     // Checker review starts from the current submission/re-submission time.
-    const anchor = e.submitted_at || e.created_at;
+    const resumedAt = (JSON.parse(e.approvals || '{}').resumed || {}).at || 0;
+    const anchor = resumedAt || e.submitted_at || e.created_at;
 
     const expDate = Date.parse((e.date || '') + 'T00:00:00');
 
@@ -148,7 +157,7 @@ async function computeSla(e) {
       'Account Manager Reviewed': ap.accounts && ap.accounts.at
     };
 
-    const anchor = anchors[e.status];
+    const anchor = ap.resumed && ap.resumed.at ? ap.resumed.at : anchors[e.status];
 
     if (anchor) {
       return {
@@ -409,7 +418,44 @@ router.get('/expenses', async (req, res) => {
   const rows = await db.prepare(
     `SELECT e.* FROM expenses e WHERE 1=1 ${sc.where} ${extra} ORDER BY e.created_at DESC`
   ).all(...params);
-  res.json(await Promise.all(rows.map(r => decorate(r, m))));
+  const expenses = await Promise.all(rows.map(r => decorate(r, m)));
+  const queried = expenses.filter(e => e.status === 'Query');
+  if (queried.length) {
+    const ids = queried.map(e => e.id);
+    const inList = ids.map(() => '?').join(',');
+    const openQueries = await db.prepare(
+      `SELECT id,expense_id,prev_status,assigned_to,raised_by,text FROM queries
+       WHERE status='Open' AND expense_id IN (${inList}) ORDER BY created_at DESC`
+    ).all(...ids);
+    if (openQueries.length) {
+      const queryIds = openQueries.map(q => q.id);
+      const queryIn = queryIds.map(() => '?').join(',');
+      const messages = await db.prepare(
+        `SELECT query_id,by_user,text,at FROM query_messages WHERE query_id IN (${queryIn}) ORDER BY at ASC`
+      ).all(...queryIds);
+      const raisedBy = new Map(openQueries.map(q => [q.id, q.raised_by]));
+      const latestReply = new Map();
+      for (const message of messages) {
+        if (message.by_user !== raisedBy.get(message.query_id)) latestReply.set(message.query_id, message);
+      }
+      const byExpense = new Map();
+      for (const query of openQueries) if (!byExpense.has(query.expense_id)) byExpense.set(query.expense_id, query);
+      for (const expense of queried) {
+        const query = byExpense.get(expense.id);
+        if (!query) continue;
+        const reply = latestReply.get(query.id);
+        expense.activeQuery = {
+          prevStatus: query.prev_status,
+          assignedTo: query.assigned_to,
+          assignedToName: m.usr[query.assigned_to] || '—',
+          queryText: query.text || '',
+          hasReply: !!reply,
+          replyText: reply ? reply.text : '',
+        };
+      }
+    }
+  }
+  res.json(expenses);
 });
 
 router.get('/expenses/:id', async (req, res) => {
@@ -436,7 +482,7 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
   const b = req.body;
   if (!b.date || !b.amount || !b.details) return res.status(400).json({ error: 'Date, amount and details required' });
   const siteUserForProject = req.user.role === 'site_accounts' &&
-    (req.user.all_projects || (req.user.project_ids || []).includes(b.projectId));
+    (req.user.all_projects || (req.user.project_ids || []).includes(b.projectId) || hasProjectChecker(req.user, b.projectId));
   const projectChecker = hasProjectChecker(req.user, b.projectId);
   const isAdmin = req.user.role === 'admin';
   if (!siteUserForProject && !projectChecker && !isAdmin) {
@@ -451,7 +497,9 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
   if (!siteUserId) return res.status(400).json({ error: 'Select the Site Accounts user responsible for this expense' });
   const siteUser = await loadUser(siteUserId);
   if (!siteUser || siteUser.role !== 'site_accounts' || !siteUser.active) return res.status(400).json({ error: 'Expense owner must be an active Site Accounts user' });
-  if (!siteUser.all_projects && !(siteUser.project_ids || []).includes(b.projectId)) return res.status(400).json({ error: 'The selected Site Accounts user is not assigned to this project' });
+  const siteUserHasProject = siteUser.all_projects || (siteUser.project_ids || []).includes(b.projectId);
+  const sameUserIsProjectChecker = siteUser.id === req.user.id && hasProjectChecker(siteUser, b.projectId);
+  if (!siteUserHasProject && !sameUserIsProjectChecker) return res.status(400).json({ error: 'The selected Site Accounts user is not assigned to this project' });
   const asDraft = b.asDraft === 'true' || b.asDraft === true;
 
   // P14 -- Site Users and Site Checkers cannot enter expenses dated more than 7 days ago.
@@ -535,19 +583,20 @@ router.patch('/expenses/:id', async (req, res) => {
     if (evCount.c === 0) return res.status(400).json({ error: 'This voucher has no photo/image attached, so it cannot be submitted. Please attach evidence first.' });
   }
   const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId ?? e.location_id);
+  const isQueryEdit = e.status === 'Query';
   const checkerSubmission = willSubmit && isCheckerEditable;
-  const nextStatus = b.asDraft ? 'Draft' : (checkerSubmission ? 'Checked' : 'Submitted');
-  const approvals = checkerSubmission ? JSON.stringify({ project_check: { by: req.user.id, at: now() } }) : '{}';
+  const nextStatus = isQueryEdit ? 'Query' : (b.asDraft ? 'Draft' : (checkerSubmission ? 'Checked' : 'Submitted'));
+  const approvals = isQueryEdit ? e.approvals : (checkerSubmission ? JSON.stringify({ project_check: { by: req.user.id, at: now() } }) : '{}');
   await db.prepare(`UPDATE expenses SET date=?,amount=?,category_id=?,details=?,location_id=?,
     expense_done_by=?,bill_received=?,bill_no=?,remark=?,status=?,approvals=?,submitted_at=?,updated_at=? WHERE id=?`).run(
     b.date ?? e.date, b.amount != null ? toPaise(b.amount) : e.amount, b.categoryId ?? e.category_id,
     b.details ?? e.details, locationId, b.expenseDoneBy ?? e.expense_done_by,
     b.billReceived ?? e.bill_received, b.billNo ?? e.bill_no,
-    b.remark ?? e.remark, nextStatus, approvals, (willSubmit ? now() : e.submitted_at), now(), e.id);
-  await addHistory(e.id, req.user.id, checkerSubmission ? 'Submitted' : 'Edited', checkerSubmission ? 'Updated and submitted voucher' : 'Updated voucher');
-  if (checkerSubmission) await addHistory(e.id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
+    b.remark ?? e.remark, nextStatus, approvals, (willSubmit && !isQueryEdit ? now() : e.submitted_at), now(), e.id);
+  await addHistory(e.id, req.user.id, checkerSubmission && !isQueryEdit ? 'Submitted' : 'Edited', isQueryEdit ? 'Edited during query — approval will restart when the query is resolved' : checkerSubmission ? 'Updated and submitted voucher' : 'Updated voucher');
+  if (checkerSubmission && !isQueryEdit) await addHistory(e.id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
   await logAudit(req.user, 'Edited expense', 'expense', e.voucher_no, '');
-  if (checkerSubmission) await logAudit(req.user, 'Checked by Site Checker', 'expense', e.voucher_no, 'Automatically checked on submission');
+  if (checkerSubmission && !isQueryEdit) await logAudit(req.user, 'Checked by Site Checker', 'expense', e.voucher_no, 'Automatically checked on submission');
   res.json({ ok: true });
 });
 
@@ -581,6 +630,7 @@ router.post('/expenses/:id/advance/:step', async (req, res) => {
   const reason = ((req.body && req.body.reason) || '').trim();
   if (overdue && !reason) return res.status(409).json({ error: 'This action is overdue — please provide a reason for the delay to proceed.', needReason: true });
   const approvals = JSON.parse(e.approvals || '{}');
+  delete approvals.resumed;
   approvals[step.key] = { by: req.user.id, at: now() };
   // Atomic: re-check status in the same statement that changes it, so two
   // simultaneous requests can't both succeed against the same "from" state.
@@ -649,8 +699,8 @@ router.post('/queries/:id/reply', async (req, res) => {
   const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
   if (!q) return res.status(404).json({ error: 'Not found' });
   const eR = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
-  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (eR && (eR.created_by === req.user.id || eR.site_user_id === req.user.id));
-  if (!allowed) return res.status(403).json({ error: 'Not permitted' });
+  if (!inQueryWorkflow(req.user, eR)) return res.status(403).json({ error: 'Not permitted' });
+  if (q.status !== 'Open') return res.status(409).json({ error: 'Query is closed' });
   const text = (req.body.text || '').trim();
   if (!text) return res.status(400).json({ error: 'Empty reply' });
   await db.prepare('INSERT INTO query_messages (id,query_id,by_user,text,at) VALUES (?,?,?,?,?)')
@@ -661,8 +711,9 @@ router.post('/queries/:id/resolve', async (req, res) => {
   const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
   if (!q) return res.status(404).json({ error: 'Not found' });
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
-  const allowed = q.assigned_to === req.user.id || req.user.role === 'admin' || (e && (e.created_by === req.user.id || e.site_user_id === req.user.id));
-  if (!allowed) return res.status(403).json({ error: 'Only the voucher owner or assignee can resolve' });
+  if (!inQueryWorkflow(req.user, e) || !QUERY_RESOLVER_ROLES.has(req.user.role))
+    return res.status(403).json({ error: 'Only a reviewer with access to this voucher can resolve a query' });
+  if (q.status !== 'Open') return res.status(409).json({ error: 'Query is already resolved' });
   // Delay justification -- an overdue query cannot be resolved without a reason for the delay
   const qsla = await computeSla(e);
   const overdue = e.status === 'Query' && qsla && Date.now() > qsla.dueAt;
@@ -673,20 +724,39 @@ router.post('/queries/:id/resolve', async (req, res) => {
     .run(uid(), q.id, req.user.id, overdue ? ('Marked resolved. Delay reason: ' + reason) : 'Marked resolved.', now());
   const stillOpen = await db.prepare("SELECT 1 FROM queries WHERE expense_id=? AND status='Open' LIMIT 1").get(q.expense_id);
   if (!stillOpen && e && e.status === 'Query') {
-    // P12/23 -- full ladder reset: once all queries are resolved, the voucher returns to
-    // the start and the whole chain re-approves (Site Checker -> GM -> Project Director ->
-    // operations -> accounts), regardless of who raised the query or at which stage. History is retained.
-    const creator = await loadUser(e.created_by);
-    const currentApprovals = JSON.parse(e.approvals || '{}');
-    const checkerVoucher = creator && creator.role === 'general_manager' && currentApprovals.project_check && currentApprovals.project_check.skipped;
-    const resetStatus = checkerVoucher ? 'GM Reviewed' : 'Submitted';
-    const resetApprovals = checkerVoucher ? JSON.stringify({
-      project_check: { skipped: true, reason: 'General Manager direct entry' },
-      check: { by: e.created_by, at: now() },
-    }) : '{}';
-    await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,submitted_at=?,updated_at=? WHERE id=?")
-      .run(resetStatus, resetApprovals, now(), now(), e.id);
-    await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher ? 'Re-opened — re-approval from Project Director / Incharge onward' : 'Re-submitted — full re-approval required (Site Checker → General Manager → Project Director / Incharge → Senior Accountant → Accounts Manager / Head)');
+    const dataEdited = !!(await db.prepare(
+      "SELECT 1 FROM expense_history WHERE expense_id=? AND action='Edited' AND at>=? LIMIT 1"
+    ).get(e.id, q.created_at));
+    const resumable = {
+      Submitted: 'Site Checker',
+      Checked: 'General Manager',
+      'GM Reviewed': 'Project Director / Incharge',
+      'Project Director Reviewed': 'Senior Accountant',
+      'Senior Accountant Reviewed': 'Accounts Manager / Head',
+      'Account Manager Reviewed': 'Final approval',
+    };
+    const resumeAt = e.prev_status;
+    if (!dataEdited && resumable[resumeAt]) {
+      const approvals = JSON.parse(e.approvals || '{}');
+      approvals.resumed = { by: req.user.id, at: now() };
+      await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,updated_at=? WHERE id=? AND status='Query'")
+        .run(resumeAt, JSON.stringify(approvals), now(), e.id);
+      await addHistory(e.id, req.user.id, 'Query resolved', `Returned to "${resumeAt}" — awaiting ${resumable[resumeAt]} approval (earlier approvals kept)`);
+    } else {
+      const creator = await loadUser(e.created_by);
+      const approvals = JSON.parse(e.approvals || '{}');
+      const checkerVoucher = creator && creator.role === 'site_checker' && approvals.project_check;
+      const resetStatus = checkerVoucher ? 'Checked' : 'Submitted';
+      const resetAt = now();
+      const resetApprovals = checkerVoucher
+        ? JSON.stringify({ project_check: approvals.project_check, resumed: { by: req.user.id, at: resetAt } })
+        : '{}';
+      await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,submitted_at=?,updated_at=? WHERE id=?")
+        .run(resetStatus, resetApprovals, resetAt, resetAt, e.id);
+      await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher
+        ? 'Voucher edited during query — re-approval from General Manager onward'
+        : 'Voucher edited during query — full re-approval required from Site Checker onward');
+    }
   }
   await logAudit(req.user, 'Resolved query', 'expense', q.voucher_no, '');
   res.json({ ok: true });
@@ -697,8 +767,8 @@ router.post('/queries/:id/attach', upload.array('files', 12), async (req, res) =
   const q = await db.prepare('SELECT * FROM queries WHERE id=?').get(req.params.id);
   if (!q) return res.status(404).json({ error: 'Not found' });
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(q.expense_id);
-  const allowed = [q.assigned_to, q.raised_by].includes(req.user.id) || req.user.role === 'admin' || (e && (e.created_by === req.user.id || e.site_user_id === req.user.id));
-  if (!allowed) return res.status(403).json({ error: 'Not permitted' });
+  if (!inQueryWorkflow(req.user, e)) return res.status(403).json({ error: 'Not permitted' });
+  if (q.status !== 'Open') return res.status(409).json({ error: 'Query is closed' });
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: 'No files attached' });
   for (const f of files) {
@@ -1515,7 +1585,7 @@ router.get(
 
 router.post(
   '/fund-requests/:id/print',
-  requireRole('senior_accountant', 'admin'),
+  requireRole('senior_accountant', 'accounts_manager', 'admin'),
   async (req, res) => {
     const result = await db.transaction(async () => {
       const request = await db.prepare(`

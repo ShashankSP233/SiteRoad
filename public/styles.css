@@ -44,11 +44,17 @@ h1,h2,h3{letter-spacing:-.01em}
 .side{width:230px;background:var(--slate);color:#cdd0d6;display:flex;flex-direction:column;position:fixed;inset:0 auto 0 0;z-index:20}
 .side .brand{padding:18px 18px 14px;color:#fff;border-bottom:1px solid rgba(255,255,255,.07)}
 .nav{flex:1;padding:10px;overflow-y:auto}
-.nav .group{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#6b6f78;margin:14px 10px 6px;font-weight:600}
+.nav .group{width:100%;display:flex;align-items:center;justify-content:space-between;border:0;padding:7px 10px;background:transparent;text-align:left;cursor:pointer;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#6b6f78;margin:14px 0 6px;font-weight:600}
+.nav .group:hover{color:#cdd0d6}
+.nav-group-items{max-height:1000px;opacity:1;transition:max-height .18s ease,opacity .18s ease}
+.nav-group.is-collapsed .nav-group-items{max-height:0;opacity:0;overflow:hidden}
+.group-chevron{transition:transform .18s ease}
+.nav-group.is-collapsed .group-chevron{transform:rotate(-90deg)}
 .nav a{display:flex;align-items:center;gap:11px;padding:10px 11px;border-radius:8px;color:#bfc3cb;font-size:13.5px;cursor:pointer;font-weight:500}
 .nav a:hover{background:rgba(255,255,255,.06);color:#fff}
 .nav a.active{background:var(--accent);color:#fff}
 .nav a .badge{margin-left:auto;background:var(--red);color:#fff;font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:10px}
+.query-row-meta{display:block;margin-top:3px;color:var(--muted);font-size:11px}
 .who{padding:13px 16px;border-top:1px solid rgba(255,255,255,.07);font-size:12px}
 .who .nm{color:#fff;font-weight:600}.who .rl{color:#8a8f99;font-size:11px;text-transform:capitalize}
 .who .logout{margin-top:8px;color:#bfc3cb;font-size:11.5px;cursor:pointer}.who .logout:hover{color:#fff}
@@ -90,6 +96,8 @@ tbody tr.click{cursor:pointer}tbody tr.click:hover{background:#faf8f1}
 
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
 .toolbar input,.toolbar select{padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+.review-tabs{display:flex;gap:8px;margin-bottom:16px}
+.query-row-meta{display:block;margin-top:3px;color:var(--muted);font-size:11px}
 .spacer{flex:1}
 .queue-actions{display:flex;gap:6px;flex-wrap:wrap}
 

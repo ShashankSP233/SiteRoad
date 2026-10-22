@@ -284,38 +284,36 @@ const can = {
 
 function pendingForMe(list) {
   const r = S.user.role;
+  const atStage = (e, statuses) =>
+    e.status === 'Query' ? statuses.includes(e.prev_status) : statuses.includes(e.status);
   const projectCheckPending = (e) =>
-    e.status === "Submitted" &&
+    atStage(e, ["Submitted"]) &&
     (S.user.projectCheckerIds || []).includes(e.project_id);
   const projectCheckerItems = list.filter(projectCheckPending);
   if (r === "general_manager")
     return [
       ...projectCheckerItems,
-      ...list.filter((e) => e.status === "Checked"),
+      ...list.filter((e) => atStage(e, ["Checked"])),
     ];
   if (r === "project_director")
     return [
       ...projectCheckerItems,
-      ...list.filter((e) => e.status === "GM Reviewed"),
+      ...list.filter((e) => atStage(e, ["GM Reviewed"])),
     ];
   if (r === "senior_accountant")
     return [
       ...projectCheckerItems,
-      ...list.filter((e) => e.status === "Project Director Reviewed"),
+      ...list.filter((e) => atStage(e, ["Project Director Reviewed"])),
     ];
   if (r === "accounts_manager")
     return [
       ...projectCheckerItems,
-      ...list.filter((e) =>
-        ["Senior Accountant Reviewed", "Account Manager Reviewed"].includes(
-          e.status,
-        ),
-      ),
+      ...list.filter((e) => atStage(e, ["Senior Accountant Reviewed", "Account Manager Reviewed"])),
     ];
   if (r === "account_checker")
     return [
       ...projectCheckerItems,
-      ...list.filter((e) => e.status === "Senior Accountant Reviewed"),
+      ...list.filter((e) => atStage(e, ["Senior Accountant Reviewed"])),
     ];
   if (r === "admin")
     return list.filter((e) =>
@@ -326,7 +324,7 @@ function pendingForMe(list) {
         "Project Director Reviewed",
         "Senior Accountant Reviewed",
         "Account Manager Reviewed",
-      ].includes(e.status),
+      ].includes(e.status) || (e.status === "Query" && e.prev_status),
     );
   return projectCheckerItems;
 }
@@ -338,78 +336,57 @@ async function buildNav() {
     } catch (e) {}
   }
   const items = [];
-  if (!can.reviewOnly())
-    items.push(
-      { grp: "Overview" },
-      { id: "dashboard", ic: "▦", label: "Dashboard" },
-      { id: "expenses", ic: "☰", label: "All Expenses" },
-    );
-  if (can.reviewTab())
-    items.push({
-      id: "review",
-      ic: "✓",
-      label: "Review Queue",
-      badge: pend || "",
-    });
+  const addGroup = (label, links) => {
+    if (links.length) items.push({ grp: label }, ...links, { endGrp: true });
+  };
+  const overview = [];
+  if (!can.reviewOnly()) overview.push(
+    { id: "dashboard", ic: "▦", label: "Dashboard" },
+    { id: "expenses", ic: "☰", label: "All Expenses" },
+  );
+  if (can.reviewTab()) overview.push({ id: "review", ic: "✓", label: "Review Queue", badge: pend || "" });
+  addGroup("Overview", overview);
 
-  if (can.fundRequestsPurchase())
-    items.push({
-      id: "fundRequestsPurchase",
-      ic: "₹",
-      label: "Print Fund Requests",
-    });
+  const funds = [];
+  if (can.funds()) funds.push({ id: "funds", ic: "₹", label: "Funds & Balance" });
+  if (can.fundRequests()) funds.push({ id: "fundRequests", ic: "₹", label: "Fund Request" });
+  if (can.fundRequestsPurchase()) funds.push({ id: "fundRequestsPurchase", ic: "₹", label: "Print Fund Requests" });
+  if (can.fundsRelease()) funds.push({ id: "fundsRelease", ic: "₹", label: "Funds Release" });
+  if (can.allFundRequests()) funds.push({ id: "allFundRequests", ic: "₹", label: "All Fund Requests" });
+  if (can.confirmFundReceipt()) funds.push({ id: "fundReceipt", ic: "✓", label: "Confirm Funds Received" });
+  if (can.payments()) funds.push({ id: "payments", ic: "✔", label: "Approved Payments" });
+  addGroup("Funds", funds);
 
-  if (can.fundsRelease())
-    items.push({
-      id: "fundsRelease",
-      ic: "₹",
-      label: "Funds Release",
-    });
+  const reports = [];
+  if (can.reports() || can.downloadVouchers()) reports.push({ id: "exports", ic: "⤓", label: "Reports & Downloads" });
+  if (can.analytics()) reports.push({ id: "analytics", ic: "▥", label: "Analytics" });
+  addGroup("Reports", reports);
 
-  if (can.allFundRequests())
-    items.push({
-      id: "allFundRequests",
-      ic: "₹",
-      label: "All Fund Requests",
-    });
+  const administration = [];
+  if (S.user.role === "accounts_manager") administration.push({ id: "accountCheckers", ic: "◎", label: "Account Checkers" });
+  if (can.admin()) administration.push({ id: "users", ic: "◎", label: "Users & Access" }, { id: "masters", ic: "⚙", label: "Masters" });
+  if (can.audit()) administration.push({ id: "audit", ic: "⌗", label: "Audit Trail" });
+  addGroup("Administration", administration);
 
-  if (can.funds())
-    items.push({ id: "funds", ic: "₹", label: "Funds & Balance" });
-  if (can.reports())
-    items.push(
-      { grp: "Reports" },
-      { id: "reports", ic: "⤓", label: "Reports & Export" },
-    );
-  if (can.payments())
-    items.push({ id: "payments", ic: "✔", label: "Approved Payments" });
-  if (can.downloadVouchers())
-    items.push({ id: "downloadVouchers", ic: "⇩", label: "Download Vouchers" });
-  if (can.fundRequests())
-    items.push({
-      id: "fundRequests",
-      ic: "₹",
-      label: "Fund Request",
-    });
-  if (can.confirmFundReceipt())
-    items.push({ id: "fundReceipt", ic: "✓", label: "Confirm Funds Received" });
-  if (can.analytics())
-    items.push({ id: "analytics", ic: "📊", label: "Analytics" });
-  if (can.admin() || can.audit() || S.user.role === "accounts_manager") {
-    items.push({ grp: "Administration" });
-    if (S.user.role === "accounts_manager")
-      items.push({ id: "accountCheckers", ic: "◎", label: "Account Checkers" });
-    if (can.admin())
-      items.push({ id: "users", ic: "◎", label: "Users & Access" });
-    if (can.admin()) items.push({ id: "masters", ic: "⚙", label: "Masters" });
-    if (can.audit()) items.push({ id: "audit", ic: "⌗", label: "Audit Trail" });
-  }
-  $("#nav").innerHTML = items
-    .map((it) =>
-      it.grp
-        ? `<div class="group">${it.grp}</div>`
-        : `<a data-pg="${it.id}" onclick="go('${it.id}')"><span>${it.ic}</span><span>${it.label}</span>${it.badge ? `<span class="badge">${it.badge}</span>` : ""}</a>`,
-    )
-    .join("");
+  let navHtml = "";
+  let groupOpen = false;
+  items.forEach((it) => {
+    if (it.endGrp) {
+      if (groupOpen) navHtml += "</div></section>";
+      groupOpen = false;
+      return;
+    }
+    if (it.grp) {
+      if (groupOpen) navHtml += "</div></section>";
+      const collapsed = localStorage.getItem(`nav-group-${it.grp}`) === "collapsed";
+      navHtml += `<section class="nav-group${collapsed ? " is-collapsed" : ""}" data-group="${esc(it.grp)}"><button class="group" type="button" aria-expanded="${!collapsed}" onclick="toggleNavGroup('${esc(it.grp)}', this)"><span>${esc(it.grp)}</span><span class="group-chevron" aria-hidden="true">⌄</span></button><div class="nav-group-items">`;
+      groupOpen = true;
+      return;
+    }
+    navHtml += `<a data-pg="${it.id}" onclick="go('${it.id}')"><span>${it.ic}</span><span>${it.label}</span>${it.badge ? `<span class="badge">${it.badge}</span>` : ""}</a>`;
+  });
+  if (groupOpen) navHtml += "</div></section>";
+  $("#nav").innerHTML = navHtml;
 
   const bn = [];
   if (!can.reviewOnly())
@@ -436,8 +413,6 @@ async function buildNav() {
     bn.push({ id: "fundReceipt", ic: "✓", label: "Receipt" });
   if (can.funds()) bn.push({ id: "funds", ic: "₹", label: "Balance" });
   if (can.payments()) bn.push({ id: "payments", ic: "✔", label: "Pay" });
-  if (can.downloadVouchers())
-    bn.push({ id: "downloadVouchers", ic: "⇩", label: "Vouchers" });
   $("#botnav").innerHTML = bn
     .map(
       (it) =>
@@ -445,12 +420,18 @@ async function buildNav() {
     )
     .join("");
 }
+function toggleNavGroup(group, button) {
+  const section = button.closest(".nav-group");
+  const collapsed = section.classList.toggle("is-collapsed");
+  button.setAttribute("aria-expanded", String(!collapsed));
+  localStorage.setItem(`nav-group-${group}`, collapsed ? "collapsed" : "expanded");
+}
 const TITLES = {
   dashboard: ["Dashboard", "Overview of site expenses"],
   expenses: ["All Expenses", "Every recorded voucher"],
   review: ["Review Queue", "Items awaiting your action"],
   funds: ["Funds & Balance", "Money given vs spent per project"],
-  reports: ["Reports & Export", "Filter and download CSV"],
+  exports: ["Reports & Downloads", "Download vouchers and export filtered reports"],
   fundRequests: [
     "Fund Request",
     "Select Payment Approved vouchers and request funds",
@@ -582,7 +563,7 @@ function expenseTable(rows, opts) {
   opts = opts || {};
   const showReviewActions = opts.reviewActions === true;
   if (!rows.length) return '<div class="empty">No matching expenses.</div>';
-  return `<div class="table-wrap"><table><thead><tr><th>Voucher</th><th>Date</th><th>Details</th><th>Site Accounts User</th><th>Category</th><th>Project</th><th class="num">Amount</th><th>Status</th>${showReviewActions ? "<th>Actions</th>" : ""}</tr></thead><tbody>${rows.map((e) => `<tr class="click" onclick="Detail.open('${e.id}')"><td class="mono">${esc(e.voucher_no)}</td><td>${fmtDate(e.date)}</td><td>${esc((e.details || "").slice(0, 42))}${(e.details || "").length > 42 ? "…" : ""} ${e.evidenceCount ? `<span class="tag">📎${e.evidenceCount}</span>` : ""}${e.status === "Paid" ? ' <span class="tag">💰 Receipt confirmed</span>' : e.paid ? ' <span class="tag">Paid at entry</span>' : ""} ${previousDelayBadge(e)} ${overallSlaBadge(e)} ${slaBadge(e)}</td><td>${esc(e.siteUserName || e.createdByName || "—")}</td><td><span class="tag">${esc(e.categoryName)}</span></td><td>${esc(e.projectCode)}</td><td class="num">${money(e.amount)}</td><td>${pill(e.status)}</td>${showReviewActions ? `<td>${e.status === "Account Manager Reviewed" ? `<div class="queue-actions" onclick="event.stopPropagation()"><button class="btn btn-primary btn-sm" style="background:var(--green)" onclick="Detail.advance('${e.id}','approve')">Accept</button><button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="Detail.reject('${e.id}')">Reject</button><button class="btn btn-ghost btn-sm" onclick="Detail.raiseQuery('${e.id}')">Query</button></div>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Voucher</th><th>Date</th><th>Details</th><th>Site Accounts User</th><th>Category</th><th>Project</th><th class="num">Amount</th><th>Status</th>${showReviewActions ? "<th>Actions</th>" : ""}</tr></thead><tbody>${rows.map((e) => `<tr class="click" onclick="Detail.open('${e.id}')"><td class="mono">${esc(e.voucher_no)}</td><td>${fmtDate(e.date)}</td><td>${esc((e.details || "").slice(0, 42))}${(e.details || "").length > 42 ? "…" : ""} ${e.evidenceCount ? `<span class="tag">📎${e.evidenceCount}</span>` : ""}${e.status === "Paid" ? ' <span class="tag">💰 Receipt confirmed</span>' : e.paid ? ' <span class="tag">Paid at entry</span>' : ""} ${previousDelayBadge(e)} ${overallSlaBadge(e)} ${slaBadge(e)}${e.activeQuery ? `<span class="query-row-meta">Query at ${esc(e.activeQuery.prevStatus)} · assigned to ${esc(e.activeQuery.assignedToName)} · ${esc(e.activeQuery.queryText.slice(0, 90))}${e.activeQuery.hasReply ? ` · Latest reply: ${esc(e.activeQuery.replyText.slice(0, 70))}` : " · waiting for reply"}</span>` : ""}</td><td>${esc(e.siteUserName || e.createdByName || "—")}</td><td><span class="tag">${esc(e.categoryName)}</span></td><td>${esc(e.projectCode)}</td><td class="num">${money(e.amount)}</td><td>${pill(e.status)}</td>${showReviewActions ? `<td>${e.status === "Account Manager Reviewed" ? `<div class="queue-actions" onclick="event.stopPropagation()"><button class="btn btn-primary btn-sm" style="background:var(--green)" onclick="Detail.advance('${e.id}','approve')">Accept</button><button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="Detail.reject('${e.id}')">Reject</button><button class="btn btn-ghost btn-sm" onclick="Detail.raiseQuery('${e.id}')">Query</button></div>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
 }
 
 /* ============ views ============ */
@@ -930,7 +911,8 @@ Views.downloadVouchers = async function () {
     .map((status) => `<option value="${esc(status)}">${esc(status)}</option>`)
     .join("");
 
-  $("#content").innerHTML = `
+  const target = $("#exports-vouchers") || $("#content");
+  target.innerHTML = `
     <div class="card card-pad" style="margin-bottom:16px">
       <div class="toolbar">
         <input id="dv-q" placeholder="Search voucher / details…" oninput="Views._filterDownloadVouchers()">
@@ -1908,7 +1890,7 @@ Views._openFundRequest = async function (id) {
             ["admin", "accounts_manager"].includes(S.user.role)
               ? `
             <button class="btn btn-ghost" onclick="Views._printFundRequest('${esc(r.id)}')">Print Request</button>
-            ${["senior_accountant", "admin"].includes(S.user.role) && r.status === "Requested" ? `<button class="btn btn-primary" onclick="Views._markFundRequestPrinted('${esc(r.id)}')">Mark Request Printed</button>` : ""}
+            ${["senior_accountant", "accounts_manager", "admin"].includes(S.user.role) && r.status === "Requested" ? `<button class="btn btn-primary" onclick="Views._markFundRequestPrinted('${esc(r.id)}')">Mark Request Printed</button>` : ""}
           `
               : ""
           }
@@ -3399,7 +3381,11 @@ Views._filterExp = function () {
 };
 
 Views.review = async function () {
-  const rows = pendingForMe(await api("GET", "/expenses"));
+  const allRows = await api("GET", "/expenses");
+  const rows = pendingForMe(allRows);
+  const queries = allRows.filter((e) => e.status === "Query");
+  Views._allReviewRows = allRows;
+  Views._reviewRows = rows;
   const hint =
     {
       site_accounts: "Submitted items awaiting Site Checker review.",
@@ -3414,8 +3400,45 @@ Views.review = async function () {
       account_checker: "Items awaiting Level 4 accounts review.",
       admin: "All items in the review pipeline.",
     }[S.user.role] || "";
-  $("#content").innerHTML =
-    `<div class="card card-pad" style="margin-bottom:16px;display:flex;align-items:center"><div class="csub" style="margin:0">${esc(hint)}</div><span class="tag" style="margin-left:auto">${rows.length} pending</span></div><div class="card">${expenseTable(rows, { reviewActions: S.user.role === "accounts_manager" })}</div>`;
+  $("#content").innerHTML = `<div class="card card-pad" style="margin-bottom:16px;display:flex;align-items:center"><div class="csub" style="margin:0">${esc(hint)}</div><span class="tag" style="margin-left:auto">${rows.length} pending</span></div>
+    <div class="card card-pad review-tabs"><button id="review-tab-queue" class="btn btn-primary btn-sm" onclick="Views._showReviewTab('queue')">My Queue (${rows.length})</button><button id="review-tab-queries" class="btn btn-ghost btn-sm" onclick="Views._showReviewTab('queries')">All Queries (${queries.length})</button></div>
+    <div class="toolbar card card-pad" style="padding:12px 14px"><input id="review-search" placeholder="Search voucher no. or details…" oninput="Views._filterReviewQueue()"><select id="review-project" onchange="Views._filterReviewQueue()"><option value="">All projects</option>${[...new Map(allRows.map((e) => [e.project_id, { id: e.project_id, name: e.projectName }])).values()].map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}</select><select id="review-category" onchange="Views._filterReviewQueue()"><option value="">All categories</option>${[...new Map(allRows.map((e) => [e.category_id, { id: e.category_id, name: e.categoryName }])).values()].map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("")}</select><select id="review-sort" onchange="Views._filterReviewQueue()"><option value="submitted-newest">Newest first</option><option value="submitted-oldest">Oldest first</option><option value="date-newest">Voucher date: newest</option><option value="date-oldest">Voucher date: oldest</option><option value="voucher-asc">Voucher no.: A–Z</option><option value="amount-desc">Amount: high to low</option><option value="amount-asc">Amount: low to high</option></select><span id="review-count" class="csub" style="margin:0"></span></div><div class="card" id="review-table"></div>`;
+  Views._showReviewTab("queue");
+};
+
+Views._showReviewTab = function (tab) {
+  Views._reviewTab = tab;
+  const queue = $("#review-tab-queue"), queries = $("#review-tab-queries");
+  if (queue) queue.className = `btn btn-sm ${tab === "queue" ? "btn-primary" : "btn-ghost"}`;
+  if (queries) queries.className = `btn btn-sm ${tab === "queries" ? "btn-primary" : "btn-ghost"}`;
+  Views._filterReviewQueue();
+};
+
+Views._filterReviewQueue = function () {
+  let rows = Views._reviewTab === "queries"
+    ? (Views._allReviewRows || []).filter((e) => e.status === "Query")
+    : [...(Views._reviewRows || [])];
+  const search = (( $("#review-search") || {}).value || "").trim().toLowerCase();
+  const project = $("#review-project")?.value || "";
+  const category = $("#review-category")?.value || "";
+  const sort = $("#review-sort")?.value || "submitted-newest";
+  if (search) rows = rows.filter((e) => String(e.voucher_no || "").toLowerCase().includes(search) || String(e.details || "").toLowerCase().includes(search));
+  if (project) rows = rows.filter((e) => e.project_id === project);
+  if (category) rows = rows.filter((e) => e.category_id === category);
+  const voucherDate = (e) => Date.parse(e.date || "") || e.created_at || 0;
+  rows.sort((a, b) => {
+    if (sort === "submitted-oldest") return a.created_at - b.created_at;
+    if (sort === "date-newest") return voucherDate(b) - voucherDate(a);
+    if (sort === "date-oldest") return voucherDate(a) - voucherDate(b);
+    if (sort === "voucher-asc") return String(a.voucher_no || "").localeCompare(String(b.voucher_no || ""));
+    if (sort === "amount-desc") return Number(b.amount || 0) - Number(a.amount || 0);
+    if (sort === "amount-asc") return Number(a.amount || 0) - Number(b.amount || 0);
+    return b.created_at - a.created_at;
+  });
+  const table = $("#review-table");
+  if (table) table.innerHTML = expenseTable(rows, { reviewActions: S.user.role === "accounts_manager" });
+  const count = $("#review-count");
+  if (count) count.textContent = `${rows.length} vouchers · ${money(rows.reduce((sum, e) => sum + Number(e.amount || 0), 0))}`;
 };
 
 Views.funds = async function () {
@@ -3477,7 +3500,8 @@ Views._markVoucherPrinted = async function (requestId, expenseId) {
 Views.reports = async function () {
   const cats = S.categories,
     prj = S.projects;
-  $("#content").innerHTML = `<div class="card card-pad">
+  const target = $("#exports-report") || $("#content");
+  target.innerHTML = `<div class="card card-pad">
     <h3>Report Filters</h3><div class="csub">Filter the dataset, then download CSV</div>
     <div class="frow three" style="margin-top:6px">
       <div class="field"><label>From</label><input type="date" id="rp-from"></div>
@@ -3493,6 +3517,25 @@ Views.reports = async function () {
     <div class="frow"><div class="field"><label>Project</label><select id="rp-prj"><option value="">All</option>${prj.map((p) => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join("")}</select></div></div>
     <div style="margin-top:10px"><button class="btn btn-primary" onclick="Views._csv()">⤓ Download CSV</button></div>
   </div>`;
+};
+Views.exports = async function () {
+  const tabs = [];
+  if (can.downloadVouchers()) tabs.push({ id: "vouchers", label: "Voucher Downloads" });
+  if (can.reports()) tabs.push({ id: "report", label: "Reports & Export" });
+  const initialTab = tabs[0]?.id || "vouchers";
+  $("#content").innerHTML = `<div class="card card-pad review-tabs">${tabs.map((tab) => `<button id="exports-tab-${tab.id}" class="btn btn-sm ${tab.id === initialTab ? "btn-primary" : "btn-ghost"}" onclick="Views._showExportsTab('${tab.id}')">${tab.label}</button>`).join("")}</div><div id="exports-vouchers" style="display:none"></div><div id="exports-report" style="display:none"></div>`;
+  if (can.downloadVouchers()) await Views.downloadVouchers();
+  if (can.reports()) await Views.reports();
+  Views._showExportsTab(initialTab);
+};
+Views._showExportsTab = function (tab) {
+  Views._exportsTab = tab;
+  ["vouchers", "report"].forEach((id) => {
+    const panel = $(`#exports-${id}`);
+    const button = $(`#exports-tab-${id}`);
+    if (panel) panel.style.display = tab === id ? "" : "none";
+    if (button) button.className = `btn btn-sm ${tab === id ? "btn-primary" : "btn-ghost"}`;
+  });
 };
 Views._csv = function () {
   const q = new URLSearchParams();
@@ -4012,6 +4055,7 @@ const Detail = {
       "Senior Accountant Reviewed": "accounts",
       "Account Manager Reviewed": "approved",
     };
+    const activeStatus = e.status === "Query" ? e.prev_status : e.status;
     return steps
       .map(([k, label], i) => {
         const a = ap[k];
@@ -4024,9 +4068,9 @@ const Detail = {
           meta = a.skipped
             ? a.reason || "Skipped"
             : userName(a.by) + " · " + fmtDT(a.at);
-        } else if (nowMap[e.status] === k) {
+        } else if (nowMap[activeStatus] === k) {
           cls = "now";
-          meta = "Pending now";
+          meta = e.status === "Query" ? "Paused — query open" : "Pending now";
         }
         return `<div class="lvl"><div class="dot ${cls}">${mark}</div><div><div class="lt">${label}</div><div class="lm">${esc(meta)}</div></div></div>`;
       })
@@ -4152,7 +4196,7 @@ const Detail = {
   },
   raiseQuery(id) {
     Modal.open(
-      `<div class="modal-head"><h3>Raise Query</h3><button class="x" onclick="Detail.open('${id}')">×</button></div><div class="modal-body"><div class="csub" style="margin:0 0 10px">This query goes to the Site Accounts user responsible for this voucher. Once resolved, the voucher returns to the review chain for re-approval.</div><div class="field full"><label>Query *</label><textarea id="q-msg" rows="3" placeholder="What needs to be clarified or corrected?"></textarea></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Detail.open('${id}')">Back</button><button class="btn btn-primary" onclick="Detail.doRaiseQuery('${id}')">Send</button></div>`,
+      `<div class="modal-head"><h3>Raise Query</h3><button class="x" onclick="Detail.open('${id}')">×</button></div><div class="modal-body"><div class="csub" style="margin:0 0 10px">This query goes to the Site Accounts user responsible for this voucher. Once resolved, it returns to the same review stage and earlier approvals stay in place. If voucher details are edited while the query is open, approval restarts; a completed Site Checker step remains complete for vouchers entered by a Site Checker.</div><div class="field full"><label>Query *</label><textarea id="q-msg" rows="3" placeholder="What needs to be clarified or corrected?"></textarea></div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Detail.open('${id}')">Back</button><button class="btn btn-primary" onclick="Detail.doRaiseQuery('${id}')">Send</button></div>`,
     );
   },
   async doRaiseQuery(id) {
@@ -4172,17 +4216,9 @@ const Detail = {
     }
   },
   queryCard(q, e) {
-    const meCreator = !!(
-      e &&
-      (e.created_by === S.user.id || e.site_user_id === S.user.id)
-    );
-    const canResolve =
-      q.status === "Open" &&
-      (q.assigned_to === S.user.id || S.user.role === "admin" || meCreator);
-    const canReply =
-      q.status === "Open" &&
-      ([q.assigned_to, q.raised_by].includes(S.user.id) || meCreator);
-    return `<div class="query-item"><div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="pill ${q.status === "Open" ? "p-qry" : "p-app"}">${q.status}</span><span class="csub" style="margin:0">${esc(q.raisedByName)} → ${esc(q.assignedToName)}</span></div>${q.thread.map((m) => `<div class="q-msg">${esc(m.text)}<div class="q-meta">${esc(m.byName)} · ${fmtDT(m.at)}</div></div>`).join("")}${canReply ? `<div style="margin-top:8px;display:flex;gap:8px"><input id="qr-${q.id}" placeholder="Reply…" style="flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:7px"><button class="btn btn-ghost btn-sm" onclick="Detail.reply('${q.id}','${q.expense_id}')">Reply</button>${canResolve ? `<button class="btn btn-primary btn-sm" onclick="Detail.resolve('${q.id}','${q.expense_id}')">Resolve</button>` : ""}</div><div style="margin-top:6px"><input type="file" id="qf-${q.id}" accept="image/*,application/pdf" multiple style="display:none" onchange="Detail.attach('${q.id}','${q.expense_id}')"><button class="btn btn-ghost btn-sm" onclick="$('#qf-${q.id}').click()">📎 Add photo / PDF</button></div>` : ""}</div>`;
+    const canResolve = q.status === "Open" && can.review();
+    const canReply = q.status === "Open";
+    return `<div class="query-item"><div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="pill ${q.status === "Open" ? "p-qry" : "p-app"}">${q.status}</span><span class="csub" style="margin:0">${esc(q.raisedByName)} → ${esc(q.assignedToName)}${q.prev_status ? ` · raised at ${esc(q.prev_status)}` : ""}</span></div>${q.thread.map((m) => `<div class="q-msg">${esc(m.text)}<div class="q-meta">${esc(m.byName)} · ${fmtDT(m.at)}</div></div>`).join("")}${canReply ? `<div style="margin-top:8px;display:flex;gap:8px"><input id="qr-${q.id}" placeholder="Reply…" style="flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:7px"><button class="btn btn-ghost btn-sm" onclick="Detail.reply('${q.id}','${q.expense_id}')">Reply</button>${canResolve ? `<button class="btn btn-primary btn-sm" onclick="Detail.resolve('${q.id}','${q.expense_id}')">Resolve</button>` : ""}</div><div style="margin-top:6px"><input type="file" id="qf-${q.id}" accept="image/*,application/pdf" multiple style="display:none" onchange="Detail.attach('${q.id}','${q.expense_id}')"><button class="btn btn-ghost btn-sm" onclick="$('#qf-${q.id}').click()">📎 Add photo / PDF</button></div>` : ""}</div>`;
   },
   async reply(qid, eid) {
     const v = $("#qr-" + qid).value.trim();
