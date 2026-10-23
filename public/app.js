@@ -749,21 +749,21 @@ Views.analytics = async function () {
       "Where the money sits across the workflow",
       barChart(sva),
     ) +
-    card(
-      "Spend by Category",
-      "Submitted vouchers (excludes drafts & rejected)",
-      barChart(catRows, { count: true }),
-    ) +
+    // card(
+    //   "Spend by Category",
+    //   "Submitted vouchers (excludes drafts & rejected)",
+    //   barChart(catRows, { count: true }),
+    // ) +
     card(
       "Spend by Site / Project",
       "Submitted vouchers (excludes drafts & rejected)",
       barChart(projRows, { count: true }),
     ) +
-    card(
-      "Monthly Spend",
-      "Last 6 months, by expense date",
-      barChart(monthRows),
-    ) +
+    // card(
+    //   "Monthly Spend",
+    //   "Last 6 months, by expense date",
+    //   barChart(monthRows),
+    // ) +
     `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Money health</h3>` +
     `<div class="grid stat-row" style="margin-bottom:18px">
        <div class="stat green"><div class="lab">Funds Released</div><div class="val">${money(b.released)}</div></div>
@@ -775,16 +775,16 @@ Views.analytics = async function () {
       "Spent within allocation (red bar = over-allocated)",
       utilisationChart(d.allocationBySite),
     ) +
-    card(
-      "Unpaid Outflow — " + money(d.unpaidTotal),
-      "Approved but not yet paid, by project",
-      barChart(
-        d.unpaidByProject.map((p) => ({
-          label: (p.code ? p.code + " · " : "") + p.name,
-          value: p.amount,
-        })),
-      ),
-    ) +
+    // card(
+    //   "Unpaid Outflow — " + money(d.unpaidTotal),
+    //   "Approved but not yet paid, by project",
+    //   barChart(
+    //     d.unpaidByProject.map((p) => ({
+    //       label: (p.code ? p.code + " · " : "") + p.name,
+    //       value: p.amount,
+    //     })),
+    //   ),
+    // ) +
     `<div class="card" style="margin-bottom:18px"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><div><h3>Budget vs Actual — ${fmtMonth(new Date().toISOString().slice(0, 7))}</h3><div class="csub" style="margin:0">Incurred spend within this month's budget (red bar = over budget)</div></div><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="BudgetsAdmin.set()">+ Set Budget</button></div><div style="padding:16px">${
       d.budgetVsActual.length
         ? utilisationChart(
@@ -797,50 +797,51 @@ Views.analytics = async function () {
           )
         : '<div class="empty">No budgets set for this month yet.</div>'
     }</div></div>` +
-    `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Workflow speed</h3>` +
-    card(
-      "Approval Turnaround by Stage",
-      "Average days at each step",
-      barChart(
-        d.turnaround.map((s) => ({
-          label: s.stage,
-          value: s.avgDays,
-          count: s.count,
-        })),
-        { fmt: (v) => v + " d", count: true },
-      ),
-    ) +
-    card(
-      "SLA Status",
-      "Pending vouchers: on time vs overdue",
-      barChart(
-        [
-          { label: "On track", value: d.sla.onTrack, color: "#22a06b" },
-          { label: "Overdue", value: d.sla.overdue, color: "#e5484d" },
-        ],
-        { fmt: cnt },
-      ),
-    ) +
-    card(
-      "Pending Aging",
-      "How long pending vouchers have waited",
-      barChart(
-        d.aging.map((a) => ({ label: a.bucket, value: a.count })),
-        { fmt: cnt },
-      ),
-    ) +
-    card(
-      "Throughput per Approver",
-      "Approval actions cleared",
-      barChart(
-        d.throughput.map((x) => ({
-          label:
-            x.name + (x.role && ROLES[x.role] ? " · " + ROLES[x.role] : ""),
-          value: x.cleared,
-        })),
-        { fmt: cnt },
-      ),
-    );
+    `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Workflow speed</h3>` 
+    // +
+    // card(
+    //   "Approval Turnaround by Stage",
+    //   "Average days at each step",
+    //   barChart(
+    //     d.turnaround.map((s) => ({
+    //       label: s.stage,
+    //       value: s.avgDays,
+    //       count: s.count,
+    //     })),
+    //     { fmt: (v) => v + " d", count: true },
+    //   ),
+    // ) +
+    // card(
+    //   "SLA Status",
+    //   "Pending vouchers: on time vs overdue",
+    //   barChart(
+    //     [
+    //       { label: "On track", value: d.sla.onTrack, color: "#22a06b" },
+    //       { label: "Overdue", value: d.sla.overdue, color: "#e5484d" },
+    //     ],
+    //     { fmt: cnt },
+    //   ),
+    // ) +
+    // card(
+    //   "Pending Aging",
+    //   "How long pending vouchers have waited",
+    //   barChart(
+    //     d.aging.map((a) => ({ label: a.bucket, value: a.count })),
+    //     { fmt: cnt },
+    //   ),
+    // ) +
+    // card(
+    //   "Throughput per Approver",
+    //   "Approval actions cleared",
+    //   barChart(
+    //     d.throughput.map((x) => ({
+    //       label:
+    //         x.name + (x.role && ROLES[x.role] ? " · " + ROLES[x.role] : ""),
+    //       value: x.cleared,
+    //     })),
+    //     { fmt: cnt },
+    //   ),
+    // );
 };
 Views.payments = async function () {
   const ex = await api("GET", "/expenses");
