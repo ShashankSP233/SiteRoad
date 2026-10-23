@@ -796,9 +796,9 @@ Views.analytics = async function () {
             })),
           )
         : '<div class="empty">No budgets set for this month yet.</div>'
-    }</div></div>` +
-    `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Workflow speed</h3>` 
+    }</div></div>` 
     // +
+    // `<h3 style="margin:22px 0 12px;color:var(--muted,#666)">Workflow speed</h3>` +
     // card(
     //   "Approval Turnaround by Stage",
     //   "Average days at each step",
