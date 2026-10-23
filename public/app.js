@@ -3576,11 +3576,11 @@ Views.funds = async function () {
     (d.siteBalances || [])
       .map(
         (s) => `
-    <tr><td><b>${esc(s.userName)}</b></td><td class="num mono">${money(s.received)}</td><td class="num mono">${money(s.spent)}</td><td class="num mono ${s.balance >= 0 ? "bal-pos" : "bal-neg"}">${money(s.balance)}</td></tr>
+    <tr><td><b>${esc(s.userName)}</b></td><td class="num mono">${money(s.received)}</td><td class="num mono">${money(s.spent)}</td><td class="num mono">${money(s.approved)}</td><td class="num mono ${s.balance >= 0 ? "bal-pos" : "bal-neg"}">${money(s.balance)}</td></tr>
   `,
       )
       .join("") ||
-    '<tr><td colspan="4"><div class="empty">No confirmed Site Accounts balances yet.</div></td></tr>';
+    '<tr><td colspan="5"><div class="empty">No confirmed Site Accounts balances yet.</div></td></tr>';
   const fundRows =
     (d.funds || [])
       .map(
@@ -3594,14 +3594,14 @@ Views.funds = async function () {
     ? ""
     : `
     <div class="card" style="margin-bottom:18px">
-      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Balances by Site Accounts User</h3><div class="csub" style="margin:0">Only payments confirmed by the assigned Site Accounts user are included.</div></div>
-      <div class="table-wrap"><table><thead><tr><th>Site Accounts User</th><th class="num">Received</th><th class="num">Spent</th><th class="num">Usable Balance</th></tr></thead><tbody>${siteRows}</tbody></table></div>
+      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Balances by Site Accounts User</h3><div class="csub" style="margin:0">Usable balance is confirmed receipts minus approved vouchers.</div></div>
+      <div class="table-wrap"><table><thead><tr><th>Site Accounts User</th><th class="num">Received</th><th class="num">Spent</th><th class="num">Approved</th><th class="num">Usable Balance</th></tr></thead><tbody>${siteRows}</tbody></table></div>
     </div>`;
   $("#content").innerHTML = `
     <div class="grid stat-row" style="margin-bottom:18px">
       <div class="stat green"><div class="lab">Funds Received</div><div class="val">${money(t.received)}</div><div class="sub2">confirmed receipts${ownAccount ? " for your account" : " across Site Accounts users"}</div></div>
       <div class="stat accent"><div class="lab">Expenses</div><div class="val">${money(t.spent)}</div><div class="sub2">excluding rejected and drafts</div></div>
-      <div class="stat blue"><div class="lab">Usable Balance</div><div class="val" style="color:${t.balance >= 0 ? "var(--green)" : "var(--red)"}">${money(t.balance)}</div><div class="sub2">released funds awaiting receipt are excluded</div></div>
+      <div class="stat blue"><div class="lab">Usable Balance</div><div class="val" style="color:${t.balance >= 0 ? "var(--green)" : "var(--red)"}">${money(t.balance)}</div><div class="sub2">confirmed receipts less approved vouchers</div></div>
     </div>
     ${balanceTable}
     <div class="card"><div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Confirmed Fund Receipts</h3></div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Project</th><th>Credited To</th><th class="num">Amount</th><th>Confirmed By</th><th>Note</th></tr></thead><tbody>${fundRows}</tbody></table></div></div>`;

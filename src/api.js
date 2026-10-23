@@ -859,6 +859,13 @@ router.get('/funds', async (req, res) => {
     GROUP BY COALESCE(site_user_id,created_by)
   `).all(...projFilter);
   const spentByUser = Object.fromEntries(spendRows.map(r => [r.site_user_id, toRupees(r.spent)]));
+  const approvedRows = await db.prepare(`
+    SELECT COALESCE(site_user_id,created_by) site_user_id, COALESCE(SUM(amount),0) approved
+    FROM expenses
+    WHERE status IN ('Approved','Payment Approved','Paid') AND project_id IN (${inq})
+    GROUP BY COALESCE(site_user_id,created_by)
+  `).all(...projFilter);
+  const approvedByUser = Object.fromEntries(approvedRows.map(r => [r.site_user_id, toRupees(r.approved)]));
 
   if (role === 'site_accounts') {
     const [receivedRow, movementRows] = await Promise.all([
@@ -867,7 +874,8 @@ router.get('/funds', async (req, res) => {
     ]);
     const received = toRupees(receivedRow.amount);
     const spent = spentByUser[req.user.id] || 0;
-    return res.json({ role, totals: { received, spent, balance: received - spent }, siteBalances: [], funds: movementRows.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: req.user.name })) });
+    const approved = approvedByUser[req.user.id] || 0;
+    return res.json({ role, totals: { received, spent, approved, balance: received - approved }, siteBalances: [], funds: movementRows.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: req.user.name })) });
   }
 
   const users = await db.prepare("SELECT id,name FROM users WHERE role='site_accounts' AND active=1 ORDER BY name").all();
@@ -881,10 +889,11 @@ router.get('/funds', async (req, res) => {
   const siteBalances = users.map(u => {
     const received = allocatedByUser[u.id] || 0;
     const spent = spentByUser[u.id] || 0;
-    return { userId: u.id, userName: u.name, received, spent, balance: received - spent };
+    const approved = approvedByUser[u.id] || 0;
+    return { userId: u.id, userName: u.name, received, spent, approved, balance: received - approved };
   });
   const funds = await db.prepare(`SELECT * FROM funds WHERE kind='allocation' AND to_user IS NOT NULL AND project_id IN (${inq}) ORDER BY created_at DESC`).all(...projFilter);
-  res.json({ role, totals: siteBalances.reduce((t, b) => ({ received: t.received + b.received, spent: t.spent + b.spent, balance: t.balance + b.balance }), { received: 0, spent: 0, balance: 0 }), siteBalances, funds: funds.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: m.usr[f.to_user] || null })) });
+  res.json({ role, totals: siteBalances.reduce((t, b) => ({ received: t.received + b.received, spent: t.spent + b.spent, approved: t.approved + b.approved, balance: t.balance + b.balance }), { received: 0, spent: 0, approved: 0, balance: 0 }), siteBalances, funds: funds.map(f => ({ ...f, amount: toRupees(f.amount), projectCode: (m.proj[f.project_id] || {}).code, addedByName: m.usr[f.added_by], toUserName: m.usr[f.to_user] || null })) });
 });
 
 // ================================================================ USERS & ACCESS (admin)
