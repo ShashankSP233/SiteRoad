@@ -225,7 +225,9 @@ async function buildPaymentZip(res, expenses) {
     'Location',
     'Bill',
     'Payment',
-    'Amount',
+    'Gross Amount',
+    'GST Amount',
+    'Total Amount',
     'Status',
     'Paid',
     'Paid On',
@@ -250,6 +252,7 @@ async function buildPaymentZip(res, expenses) {
 
   for (const e of expenses) {
     const p = e.project;
+    const breakdown = await db.prepare('SELECT gross_amount, gst_amount FROM expense_amount_breakdowns WHERE expense_id=?').get(e.id);
 
     lines.push([
       e.voucher_no,
@@ -260,6 +263,8 @@ async function buildPaymentZip(res, expenses) {
       e.locationName,
       e.bill_received || '',
       e.payment_status || '',
+      breakdown ? toRupees(breakdown.gross_amount) : '',
+      breakdown ? toRupees(breakdown.gst_amount) : '',
       toRupees(e.amount),
       e.status,
       e.paid ? 'Yes' : 'No',
@@ -295,10 +300,11 @@ async function buildPaymentZip(res, expenses) {
 
 async function decorate(e, m) {
   const p = m.proj[e.project_id];
-  const [evCount, sla, previousDelays] = await Promise.all([
+  const [evCount, sla, previousDelays, amountBreakdown] = await Promise.all([
     db.prepare('SELECT COUNT(*) c FROM evidence WHERE expense_id=?').get(e.id),
     computeSla(e),
     getPreviousDelays(e),
+    db.prepare('SELECT gross_amount, gst_amount, total_amount FROM expense_amount_breakdowns WHERE expense_id=?').get(e.id),
   ]);
   const overallSla = computeOverallSla(e);
   return {
@@ -315,6 +321,11 @@ async function decorate(e, m) {
     sla,
     overallSla,
     previousDelays,
+    amountBreakdown: amountBreakdown ? {
+      grossAmount: toRupees(amountBreakdown.gross_amount),
+      gstAmount: toRupees(amountBreakdown.gst_amount),
+      totalAmount: toRupees(amountBreakdown.total_amount),
+    } : null,
   };
 }
 
@@ -480,7 +491,26 @@ router.get('/expenses/:id', async (req, res) => {
 
 router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), async (req, res) => {
   const b = req.body;
-  if (!b.date || !b.amount || !b.details) return res.status(400).json({ error: 'Date, amount and details required' });
+  if (!b.date || !b.details) return res.status(400).json({ error: 'Date and details required' });
+  const billReceived = String(b.billReceived || 'No');
+  if (!['Yes with GST', 'Yes', 'No'].includes(billReceived)) return res.status(400).json({ error: 'Choose a valid Bill Received option' });
+  let grossPaise = null;
+  let gstPaise = null;
+  let amountPaise = null;
+  if (billReceived === 'Yes with GST') {
+    if (!String(b.grossAmount ?? '').trim() || !String(b.gstAmount ?? '').trim()) return res.status(400).json({ error: 'Gross amount and GST amount are required' });
+    const gross = Number(b.grossAmount);
+    const gst = Number(b.gstAmount);
+    if (!Number.isFinite(gross) || gross <= 0 || !Number.isFinite(gst) || gst < 0) return res.status(400).json({ error: 'Enter a valid gross amount and GST amount' });
+    grossPaise = toPaise(gross);
+    gstPaise = toPaise(gst);
+    if (grossPaise <= 0) return res.status(400).json({ error: 'Gross amount must be at least ₹0.01' });
+    amountPaise = grossPaise + gstPaise;
+  } else {
+    if (!String(b.amount ?? '').trim()) return res.status(400).json({ error: 'Amount is required' });
+    amountPaise = toPaise(b.amount);
+  }
+  if (!Number.isFinite(amountPaise) || amountPaise <= 0) return res.status(400).json({ error: 'Enter a valid amount greater than zero' });
   const siteUserForProject = req.user.role === 'site_accounts' &&
     (req.user.all_projects || (req.user.project_ids || []).includes(b.projectId) || hasProjectChecker(req.user, b.projectId));
   const projectChecker = hasProjectChecker(req.user, b.projectId);
@@ -514,7 +544,7 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
   // P13 -- on submit, alert on a likely duplicate unless the user has confirmed
   const confirmDup = b.confirmDuplicate === 'true' || b.confirmDuplicate === true;
   if (!asDraft && !confirmDup) {
-    const dup = await findDuplicate({ projectId: b.projectId, date: b.date, amount: toPaise(b.amount), categoryId: b.categoryId, billNo });
+    const dup = await findDuplicate({ projectId: b.projectId, date: b.date, amount: amountPaise, categoryId: b.categoryId, billNo });
     if (dup) return res.status(409).json({ error: dup.message, duplicate: true, match: dup.match });
   }
 
@@ -535,12 +565,18 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
       (id,voucher_no,date,amount,category_id,details,project_id,location_id,site_user_id,expense_done_by,
       bill_received,bill_no,payment_status,remark,status,approvals,created_by,created_at,updated_at,submitted_at,paid)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      id, voucher, b.date, toPaise(b.amount), b.categoryId || null, b.details, b.projectId,
-      locationId, siteUserId, b.expenseDoneBy || req.user.name, b.billReceived || 'No',
+      id, voucher, b.date, amountPaise, b.categoryId || null, b.details, b.projectId,
+      locationId, siteUserId, b.expenseDoneBy || req.user.name, billReceived,
       billNo, 'Pending', b.remark || null, status, approvals,
       req.user.id, now(), now(), asDraft ? null : now(),
       b.paid === '1' ? 1 : 0
     );
+
+    if (grossPaise != null && gstPaise != null) {
+      await db.prepare(`INSERT INTO expense_amount_breakdowns
+        (expense_id, gross_amount, gst_amount, total_amount, created_at) VALUES (?,?,?,?,?)`)
+        .run(id, grossPaise, gstPaise, amountPaise, now());
+    }
 
     for (const f of (req.files || [])) {
       await db.prepare('INSERT INTO evidence (id,expense_id,filename,original_name,mime) VALUES (?,?,?,?,?)')
@@ -549,7 +585,7 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
 
     await addHistory(id, req.user.id, asDraft ? 'Created draft' : 'Submitted', 'Voucher created');
     if (!asDraft && checkerEntry) await addHistory(id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
-    await logAudit(req.user, asDraft ? 'Created draft' : 'Submitted expense', 'expense', voucher, '₹' + b.amount);
+    await logAudit(req.user, asDraft ? 'Created draft' : 'Submitted expense', 'expense', voucher, '₹' + toRupees(amountPaise));
     if (!asDraft && checkerEntry) await logAudit(req.user, 'Checked by Site Checker', 'expense', voucher, 'Automatically checked on submission');
   });
     res.json({ id, voucherNo: voucher });
@@ -565,6 +601,19 @@ router.patch('/expenses/:id', async (req, res) => {
     ['Draft', 'Submitted', 'Query'].includes(e.status);
   if (!(isOwnerEditable || isCheckerEditable || req.user.role === 'admin')) return res.status(403).json({ error: 'Not editable' });
   const b = req.body;
+  const billReceived = String(b.billReceived ?? e.bill_received ?? 'No');
+  if (!['Yes with GST', 'Yes', 'No'].includes(billReceived)) return res.status(400).json({ error: 'Choose a valid Bill Received option' });
+  const currentBreakdown = await db.prepare('SELECT gross_amount, gst_amount FROM expense_amount_breakdowns WHERE expense_id=?').get(e.id);
+  let grossPaise = null;
+  let gstPaise = null;
+  let amountPaise = b.amount != null ? toPaise(b.amount) : e.amount;
+  if (billReceived === 'Yes with GST') {
+    grossPaise = b.grossAmount != null ? toPaise(b.grossAmount) : currentBreakdown?.gross_amount;
+    gstPaise = b.gstAmount != null ? toPaise(b.gstAmount) : currentBreakdown?.gst_amount;
+    if (grossPaise == null || gstPaise == null || grossPaise <= 0 || gstPaise < 0) return res.status(400).json({ error: 'Gross amount and GST amount are required for a GST bill' });
+    amountPaise = grossPaise + gstPaise;
+  }
+  if (!Number.isFinite(amountPaise) || amountPaise <= 0) return res.status(400).json({ error: 'Enter a valid amount greater than zero' });
   const willSubmit = !b.asDraft;
   if (b.billNo != null) {
     const billNo = String(b.billNo).trim();
@@ -589,10 +638,19 @@ router.patch('/expenses/:id', async (req, res) => {
   const approvals = isQueryEdit ? e.approvals : (checkerSubmission ? JSON.stringify({ project_check: { by: req.user.id, at: now() } }) : '{}');
   await db.prepare(`UPDATE expenses SET date=?,amount=?,category_id=?,details=?,location_id=?,
     expense_done_by=?,bill_received=?,bill_no=?,remark=?,status=?,approvals=?,submitted_at=?,updated_at=? WHERE id=?`).run(
-    b.date ?? e.date, b.amount != null ? toPaise(b.amount) : e.amount, b.categoryId ?? e.category_id,
+    b.date ?? e.date, amountPaise, b.categoryId ?? e.category_id,
     b.details ?? e.details, locationId, b.expenseDoneBy ?? e.expense_done_by,
-    b.billReceived ?? e.bill_received, b.billNo ?? e.bill_no,
+    billReceived, b.billNo ?? e.bill_no,
     b.remark ?? e.remark, nextStatus, approvals, (willSubmit && !isQueryEdit ? now() : e.submitted_at), now(), e.id);
+  if (billReceived === 'Yes with GST') {
+    await db.prepare(`INSERT INTO expense_amount_breakdowns
+      (expense_id, gross_amount, gst_amount, total_amount, created_at) VALUES (?,?,?,?,?)
+      ON CONFLICT (expense_id) DO UPDATE SET gross_amount=EXCLUDED.gross_amount,
+        gst_amount=EXCLUDED.gst_amount, total_amount=EXCLUDED.total_amount, created_at=EXCLUDED.created_at`)
+      .run(e.id, grossPaise, gstPaise, amountPaise, now());
+  } else {
+    await db.prepare('DELETE FROM expense_amount_breakdowns WHERE expense_id=?').run(e.id);
+  }
   await addHistory(e.id, req.user.id, checkerSubmission && !isQueryEdit ? 'Submitted' : 'Edited', isQueryEdit ? 'Edited during query — approval will restart when the query is resolved' : checkerSubmission ? 'Updated and submitted voucher' : 'Updated voucher');
   if (checkerSubmission && !isQueryEdit) await addHistory(e.id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
   await logAudit(req.user, 'Edited expense', 'expense', e.voucher_no, '');
@@ -1024,6 +1082,10 @@ router.get('/reports/expenses.csv', requireRole('accounts_manager', 'admin'), as
   const sc = scopeClause(req.user, 'e');
   const params = [...sc.params];
   const f = [];
+  if (String(req.query.ids || '').trim()) {
+    const ids = String(req.query.ids).split(',').map(id => id.trim()).filter(Boolean);
+    if (ids.length) { f.push(`e.id IN (${ids.map(() => '?').join(',')})`); params.push(...ids); }
+  }
   if (req.query.from) { f.push('e.date >= ?'); params.push(req.query.from); }
   if (req.query.to) { f.push('e.date <= ?'); params.push(req.query.to); }
   if (req.query.status === '__paid') { f.push('COALESCE(e.paid,0) = 1'); }
@@ -1031,8 +1093,12 @@ router.get('/reports/expenses.csv', requireRole('accounts_manager', 'admin'), as
   else if (req.query.status) { f.push('e.status = ?'); params.push(req.query.status); }
   if (req.query.projectId) { f.push('e.project_id = ?'); params.push(req.query.projectId); }
   const extra = f.length ? ' AND ' + f.join(' AND ') : '';
-  const rows = await db.prepare(`SELECT e.* FROM expenses e WHERE 1=1 ${sc.where} ${extra} ORDER BY e.date ASC`).all(...params);
-  const cols = ['Voucher', 'Date', 'Details', 'Category', 'Project', 'Location', 'Bill', 'Payment', 'Amount', 'Status', 'Paid', 'Paid On', 'Created By'];
+  const rows = await db.prepare(`SELECT e.*, ab.gross_amount, ab.gst_amount,
+      (SELECT fr.request_no FROM fund_request_items fri JOIN fund_requests fr ON fr.id=fri.fund_request_id
+       WHERE fri.expense_id=e.id ORDER BY fr.created_at DESC LIMIT 1) AS fr_no
+    FROM expenses e LEFT JOIN expense_amount_breakdowns ab ON ab.expense_id=e.id
+    WHERE 1=1 ${sc.where} ${extra} ORDER BY e.date ASC`).all(...params);
+  const cols = ['Voucher', 'Date', 'Details', 'Category', 'Project', 'Location', 'Bill', 'Payment', 'Gross Amount', 'GST Amount', 'Total Amount', 'Status', 'FR No', 'Paid', 'Paid On', 'Created By'];
   const esc = v => { v = String(v ?? ''); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
   const dcell = ms => { const t = Number(ms); return (ms && !isNaN(t)) ? new Date(t).toISOString().slice(0, 10) : ''; };
   const lines = [cols.join(',')];
@@ -1041,7 +1107,9 @@ router.get('/reports/expenses.csv', requireRole('accounts_manager', 'admin'), as
     lines.push([
       e.voucher_no, e.date, e.details, m.cat[e.category_id] || '', p ? p.code : '',
       m.loc[e.location_id] || '', e.bill_received || '', e.payment_status || '',
-      toRupees(e.amount), e.status, e.paid ? 'Yes' : 'No', dcell(e.paid_at),
+      e.gross_amount == null ? '' : toRupees(e.gross_amount),
+      e.gst_amount == null ? '' : toRupees(e.gst_amount),
+      toRupees(e.amount), e.status, e.fr_no || '', e.paid ? 'Yes' : 'No', dcell(e.paid_at),
       m.usr[e.created_by] || '',
     ].map(esc).join(','));
   });
@@ -1480,10 +1548,15 @@ router.get(
       SELECT
         fri.id AS item_id,
         fri.amount AS requested_amount,
+        ab.gross_amount AS breakdown_gross_amount,
+        ab.gst_amount AS breakdown_gst_amount,
+        ab.total_amount AS breakdown_total_amount,
         e.*
       FROM fund_request_items fri
       JOIN expenses e
         ON e.id = fri.expense_id
+      LEFT JOIN expense_amount_breakdowns ab
+        ON ab.expense_id = e.id
       WHERE fri.fund_request_id = ?
       ORDER BY e.date DESC, e.created_at DESC
     `).all(req.params.id);
@@ -1535,6 +1608,11 @@ router.get(
         ...e,
 
         amount: toRupees(e.requested_amount),
+        amountBreakdown: e.breakdown_gross_amount == null ? null : {
+          grossAmount: toRupees(e.breakdown_gross_amount),
+          gstAmount: toRupees(e.breakdown_gst_amount),
+          totalAmount: toRupees(e.breakdown_total_amount),
+        },
 
         projectCode:
           m.proj[e.project_id]?.code || '',

@@ -920,6 +920,7 @@ Views.downloadVouchers = async function () {
         <select id="dv-status" onchange="Views._filterDownloadVouchers()"><option value="">All completed statuses</option>${statusOptions}</select>
         <input id="dv-from" type="date" title="From date" onchange="Views._filterDownloadVouchers()">
         <input id="dv-to" type="date" title="To date" onchange="Views._filterDownloadVouchers()">
+        <button class="btn btn-ghost" onclick="Views._csvDownloadVouchers()">Download CSV (Gross / GST / Total)</button>
         <button class="btn btn-primary" onclick="Views._downloadSelectedVouchers()">Download Selected</button>
       </div>
       <div id="dv-count" class="csub" style="margin:0 0 12px"></div>
@@ -954,6 +955,7 @@ Views._filterDownloadVouchers = function () {
   if (from) rows = rows.filter((e) => String(e.date || "") >= from);
   if (to) rows = rows.filter((e) => String(e.date || "") <= to);
 
+  Views._filteredDownloadVouchers = rows;
   const total = rows.reduce((sum, e) => sum + (+e.amount || 0), 0);
   $("#dv-count").textContent = `${rows.length} voucher(s) · ${money(total)}`;
   $("#dv-body").innerHTML =
@@ -978,6 +980,17 @@ Views._toggleAllDownloadVouchers = function (master) {
   $$(".dv-cb").forEach((cb) => {
     cb.checked = master.checked;
   });
+};
+
+Views._csvDownloadVouchers = function () {
+  const ids = (Views._filteredDownloadVouchers || []).map((e) => e.id);
+  if (!ids.length) {
+    toast("No vouchers match the current filters", "err");
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = "/api/reports/expenses.csv?ids=" + encodeURIComponent(ids.join(","));
+  a.click();
 };
 
 Views.fundRequests = async function () {
@@ -2100,7 +2113,7 @@ Views._printFundRequest = async function (id) {
                 </td>
 
                 <td>
-                  ${["yes", "true", "1"].includes(String(e.bill_received || "").toLowerCase()) ? "Yes" : "No"}
+                  ${esc(e.bill_received || "No")}${e.amountBreakdown ? `<div class="bill-breakdown">Gross: ${money(e.amountBreakdown.grossAmount)}<br>GST: ${money(e.amountBreakdown.gstAmount)}</div>` : ""}
                 </td>
 
                 <td class="num">
@@ -2205,7 +2218,7 @@ Views._printFundRequest = async function (id) {
 
           @page {
             size: A4 portrait;
-            margin: 12mm;
+            margin: 0;
           }
 
           * {
@@ -2213,7 +2226,10 @@ Views._printFundRequest = async function (id) {
           }
 
           body {
+            width: 166mm;
             margin: 0;
+            margin-left: auto;
+            margin-right: auto;
             padding: 0;
             font-family:
               Arial,
@@ -2289,8 +2305,35 @@ Views._printFundRequest = async function (id) {
           ================================================= */
 
           .page {
-            min-height: 270mm;
+            width: 100%;
             position: relative;
+            padding-top: 0;
+          }
+
+          .print-sheet {
+            position: relative;
+            width: 166mm;
+            height: 287mm;
+            margin: 0 auto;
+            padding: 8mm 0 15mm;
+            overflow: hidden;
+            page-break-after: always;
+            break-after: page;
+          }
+
+          .print-sheet:last-child {
+            page-break-after: auto;
+            break-after: auto;
+          }
+
+          .print-page-number {
+            position: absolute;
+            bottom: 4mm;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            color: #555;
+            font: 9px Arial, Helvetica, sans-serif;
           }
           .project-name-large {
             display: block;
@@ -2659,7 +2702,15 @@ Views._printFundRequest = async function (id) {
           }
 
           .annexure {
-            page-break-before: always;
+            page-break-before: auto;
+            padding-top: 0;
+          }
+
+          .bill-breakdown {
+            margin-top: 3px;
+            font-size: 8px;
+            line-height: 1.25;
+            white-space: nowrap;
           }
 
           .annexure-title {
@@ -2843,11 +2894,7 @@ Views._printFundRequest = async function (id) {
           }
 
           @media print {
-
-            body {
-              margin: 0;
-            }
-
+            html, body { width: 166mm; margin: 0 auto; padding: 0; }
           }
 
         </style>
@@ -2856,7 +2903,6 @@ Views._printFundRequest = async function (id) {
 
 
       <body>
-
 
         <!-- =================================================
              PAGE 1
@@ -3056,6 +3102,20 @@ Views._printFundRequest = async function (id) {
                 </div>
               </div>
 
+              <!-- PURCHASE -->
+              <div class="digital-signature-box">
+                <div class="digital-signature-status">
+                  DIGITALLY VERIFIED
+                </div>
+
+                <div class="digital-signature-name">
+                  Hiren O.D. Ji
+                </div>
+
+                <div class="digital-signature-role">
+                  Project Director
+                </div>
+              </div>
 
               <!-- OPERATIONS -->
               <div class="digital-signature-box">
@@ -3138,6 +3198,72 @@ Views._printFundRequest = async function (id) {
         <script>
 
           window.onload = function () {
+          const body = document.body;
+          const summary = body.querySelector(".page");
+          const sourceAnnexures = Array.from(body.querySelectorAll(".annexure"));
+          const sheets = [];
+
+          function createSheet() {
+            const sheet = document.createElement("section");
+            sheet.className = "print-sheet";
+            body.insertBefore(sheet, body.querySelector("script"));
+            sheets.push(sheet);
+            return sheet;
+          }
+
+          const firstSheet = createSheet();
+          if (summary) firstSheet.appendChild(summary);
+
+          sourceAnnexures.forEach((source) => {
+            const sourceTable = source.querySelector(".annexure-table");
+            if (!sourceTable) return;
+            const rows = Array.from(sourceTable.tBodies[0]?.rows || []);
+            const total = sourceTable.tFoot?.cloneNode(true);
+            let currentSheet = null;
+            let currentSection = null;
+            let currentBody = null;
+
+            function startAnnexureSheet() {
+              currentSheet = createSheet();
+              currentSection = source.cloneNode(true);
+              currentBody = currentSection.querySelector("tbody");
+              currentBody.replaceChildren();
+              currentSection.querySelector("tfoot")?.remove();
+              currentSheet.appendChild(currentSection);
+            }
+
+            startAnnexureSheet();
+            rows.forEach((row) => {
+              currentBody.appendChild(row.cloneNode(true));
+              if (currentSheet.scrollHeight > currentSheet.clientHeight && currentBody.rows.length > 1) {
+                const overflowRow = currentBody.lastElementChild;
+                overflowRow.remove();
+                startAnnexureSheet();
+                currentBody.appendChild(overflowRow);
+              }
+            });
+
+            if (total) {
+              currentSection.querySelector("table").appendChild(total);
+              if (currentSheet.scrollHeight > currentSheet.clientHeight && currentBody.rows.length > 1) {
+                currentSection.querySelector("tfoot")?.remove();
+                const lastRow = currentBody.lastElementChild;
+                lastRow.remove();
+                startAnnexureSheet();
+                currentBody.appendChild(lastRow);
+                currentSection.querySelector("table").appendChild(total);
+              }
+            }
+          });
+
+          sourceAnnexures.forEach((source) => source.remove());
+          sheets.forEach((sheet, index) => {
+            const pageNumber = document.createElement("div");
+            pageNumber.className = "print-page-number";
+            pageNumber.textContent = "Page " + (index + 1) + " of " + sheets.length;
+            sheet.appendChild(pageNumber);
+          });
+
             window.print();
           };
 
@@ -3686,6 +3812,8 @@ const ExpenseForm = {
     const values = {
       "ef-date": fields.date || new Date().toISOString().slice(0, 10),
       "ef-amt": fields.amount || "",
+      "ef-gross": fields.grossAmount || "",
+      "ef-gst": fields.gstAmount || "",
       "ef-cat": fields.categoryId || "",
       "ef-det": fields.details || "",
       "ef-prj": fields.projectId || "",
@@ -3703,6 +3831,8 @@ const ExpenseForm = {
       if (el) el.value = value;
     }
 
+    this._gstMode = false;
+    this.updateAmountMode();
     this.preview();
     return true;
   },
@@ -3776,8 +3906,13 @@ const ExpenseForm = {
       <div class="modal-body">
         <div class="frow three">
           <div class="field"><label>Date *</label><input type="date" id="ef-date" value="${new Date().toISOString().slice(0, 10)}"${dateLimit ? ` min="${new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)}"` : ""}></div>
-          <div class="field"><label>Amount (₹) *</label><input type="number" id="ef-amt" step="0.01" min="0" placeholder="0.00"></div>
+          <div class="field" id="ef-standard-amount"><label>Amount (₹) *</label><input type="number" id="ef-amt" step="0.01" min="0" placeholder="0.00"></div>
           <div class="field"><label>Category *</label><select id="ef-cat">${opt(cats, (x) => x.name)}</select></div>
+        </div>
+        <div class="frow three hide" id="ef-gst-breakdown">
+          <div class="field"><label>Gross Amount (₹) *</label><input type="number" id="ef-gross" step="0.01" min="0.01" placeholder="0.00" oninput="ExpenseForm.updateGstTotal()"></div>
+          <div class="field"><label>GST Amount (₹) *</label><input type="number" id="ef-gst" step="0.01" min="0" placeholder="0.00" oninput="ExpenseForm.updateGstTotal()"></div>
+          <div class="field"><label>Total Amount (₹)</label><input type="number" id="ef-total" step="0.01" readonly placeholder="Gross + GST"></div>
         </div>
         <div class="field full"><label>Expense Details *</label><textarea id="ef-det" rows="2" placeholder="e.g. Diesel for Scorpio BR01PJ8719"></textarea></div>
         <div class="frow three">
@@ -3787,7 +3922,7 @@ const ExpenseForm = {
         </div>
         ${needsOwnerSelection ? `<div class="field full"><label>Site Accounts user responsible for this expense *</label><select id="ef-site-user"><option value="">Select Site Accounts user</option>${siteUsers.map((u) => `<option value="${esc(u.id)}" ${siteUsers.length === 1 ? "selected" : ""}>${esc(u.name)}</option>`).join("")}</select></div>` : ""}
         <div class="frow">
-          <div class="field"><label>Bill received?</label><select id="ef-billrec"><option>No</option><option>Yes</option></select></div>
+          <div class="field"><label>Bill received? *</label><select id="ef-billrec" onchange="ExpenseForm.updateAmountMode()"><option>No</option><option>Yes</option><option>Yes with GST</option></select></div>
           <div class="field"><label>Bill No. / UPI UTR No. *</label><input id="ef-billno" required placeholder="Enter bill number or UPI UTR number"><div class="csub" style="margin:4px 0 0">UPI UTR No. if bill no. not available.</div></div>
         </div>
         <div class="frow">
@@ -3803,6 +3938,10 @@ const ExpenseForm = {
       <div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
         <button class="btn btn-ghost" onclick="ExpenseForm.saveDraft()">Save Draft</button>
         <button class="btn btn-primary" onclick="ExpenseForm.submit(false)">Submit for review</button></div>`);
+
+    this._gstMode = false;
+    this._nonGstAmount = "";
+    this.updateAmountMode();
 
     if (existingDraft && !this._startedNew) {
       await this.loadDraft();
@@ -3897,6 +4036,8 @@ const ExpenseForm = {
       expenseDoneBy: $("#ef-by").value,
       billReceived: $("#ef-billrec").value,
       billNo: $("#ef-billno").value,
+      grossAmount: $("#ef-gross").value,
+      gstAmount: $("#ef-gst").value,
       paid: $("#ef-paid").value,
       remark: $("#ef-rem").value,
     };
@@ -3926,6 +4067,8 @@ const ExpenseForm = {
       expenseDoneBy: "ef-by",
       billReceived: "ef-billrec",
       billNo: "ef-billno",
+      grossAmount: "ef-gross",
+      gstAmount: "ef-gst",
       paid: "ef-paid",
       remark: "ef-rem",
     };
@@ -3941,15 +4084,25 @@ const ExpenseForm = {
     for (const f of files) fd.append("photos", f);
     if (
       !$("#ef-date").value ||
-      !$("#ef-amt").value ||
       !$("#ef-det").value.trim()
     ) {
-      toast("Date, amount and details required", "err");
+      toast("Date and details required", "err");
       return;
     }
     if (!$("#ef-billno").value.trim()) {
       toast("Enter a bill number or UPI UTR number", "err");
       $("#ef-billno").focus();
+      return;
+    }
+    if ($( "#ef-billrec").value === "Yes with GST") {
+      const gross = Number($("#ef-gross").value);
+      const gst = Number($("#ef-gst").value);
+      if (!$("#ef-gross").value || !$("#ef-gst").value || !Number.isFinite(gross) || !Number.isFinite(gst) || gross <= 0 || gst < 0) {
+        toast("Enter a valid gross amount and GST amount", "err");
+        return;
+      }
+    } else if (!$("#ef-amt").value || !Number.isFinite(Number($("#ef-amt").value)) || Number($("#ef-amt").value) <= 0) {
+      toast("Enter a valid amount greater than zero", "err");
       return;
     }
     if ($("#ef-site-user") && !$("#ef-site-user").value) {
@@ -3979,6 +4132,28 @@ const ExpenseForm = {
       toast(e.message, "err");
     }
   },
+  updateAmountMode() {
+    const gstMode = $("#ef-billrec")?.value === "Yes with GST";
+    if (gstMode && !this._gstMode) this._nonGstAmount = $("#ef-amt")?.value || "";
+    if (!gstMode && this._gstMode && this._nonGstAmount !== undefined) $("#ef-amt").value = this._nonGstAmount;
+    this._gstMode = gstMode;
+    $("#ef-standard-amount")?.classList.toggle("hide", gstMode);
+    $("#ef-gst-breakdown")?.classList.toggle("hide", !gstMode);
+    if (gstMode) this.updateGstTotal();
+  },
+  updateGstTotal() {
+    const gross = $("#ef-gross");
+    const gst = $("#ef-gst");
+    const total = $("#ef-total");
+    const amount = $("#ef-amt");
+    if (!gross || !gst || !total || !amount) return;
+    if (!gross.value || !gst.value) { total.value = ""; amount.value = ""; return; }
+    const grossPaise = Math.round(Number(gross.value) * 100);
+    const gstPaise = Math.round(Number(gst.value) * 100);
+    if (!Number.isFinite(grossPaise) || !Number.isFinite(gstPaise)) { total.value = ""; amount.value = ""; return; }
+    total.value = ((grossPaise + gstPaise) / 100).toFixed(2);
+    amount.value = total.value;
+  },
 };
 
 /* ============ detail + workflow ============ */
@@ -4004,6 +4179,11 @@ const Detail = {
           .join("")}</div>`
       : '<div class="csub" style="margin:0">No evidence attached.</div>';
     const acts = Detail.actions(e);
+    const amountBreakdown = e.amountBreakdown
+      ? dl("Gross Amount", money(e.amountBreakdown.grossAmount)) +
+        dl("GST Amount", money(e.amountBreakdown.gstAmount)) +
+        dl("Total Amount", money(e.amountBreakdown.totalAmount))
+      : "";
     const tl = e.history
       .slice()
       .reverse()
@@ -4017,7 +4197,7 @@ const Detail = {
       : '<div class="csub" style="margin:0">No queries raised.</div>';
     Modal.open(`<div class="modal-head"><h3>${esc(e.voucher_no)}</h3> ${pill(e.status)} ${previousDelayBadge(e)} ${overallSlaBadge(e)} ${slaBadge(e)}<button class="x" onclick="Modal.close()">×</button></div>
       <div class="modal-body">
-        <div class="detail-grid">${dl("Date", fmtDate(e.date))}${dl("Amount", `<b class="mono">${money(e.amount)}</b>`)}${dl("Category", `<span class="tag">${esc(e.categoryName)}</span>`)}${dl("Project", esc(e.projectName))}${dl("Location", esc(e.locationName))}${dl("Site Accounts User", esc(e.siteUserName || e.createdByName || "—"))}${dl("Done by", esc(e.expense_done_by || "—"))}${dl("Bill", esc(e.bill_received || "—") + (e.bill_no ? ` (${esc(e.bill_no)})` : ""))}${dl("Payment", e.status === "Paid" ? `Receipt confirmed${e.paid_at ? " · " + fmtDate(Number(e.paid_at)) : ""}` : e.paid ? "Marked paid at entry" : "Unpaid")}</div>
+        <div class="detail-grid">${dl("Date", fmtDate(e.date))}${dl("Amount", `<b class="mono">${money(e.amount)}</b>`)}${amountBreakdown}${dl("Category", `<span class="tag">${esc(e.categoryName)}</span>`)}${dl("Project", esc(e.projectName))}${dl("Location", esc(e.locationName))}${dl("Site Accounts User", esc(e.siteUserName || e.createdByName || "—"))}${dl("Done by", esc(e.expense_done_by || "—"))}${dl("Bill", esc(e.bill_received || "—") + (e.bill_no ? ` (${esc(e.bill_no)})` : ""))}${dl("Payment", e.status === "Paid" ? `Receipt confirmed${e.paid_at ? " · " + fmtDate(Number(e.paid_at)) : ""}` : e.paid ? "Marked paid at entry" : "Unpaid")}</div>
         <div class="dl" style="border:0">Details</div><div class="dv" style="border:0;padding-top:2px">${esc(e.details)}</div>
         ${e.remark ? `<div class="dl" style="border:0;margin-top:6px">Remark</div><div class="dv" style="border:0;padding-top:2px">${esc(e.remark)}</div>` : ""}
         <div class="section-t">Evidence</div>${ev}
