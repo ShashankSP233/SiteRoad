@@ -127,8 +127,10 @@ CREATE TABLE IF NOT EXISTS users (
   created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS projects (
-  id TEXT PRIMARY KEY, code TEXT NOT NULL, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+  id TEXT PRIMARY KEY, code TEXT NOT NULL, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  first_reviewer TEXT NOT NULL DEFAULT 'site_checker'
 );
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS first_reviewer TEXT NOT NULL DEFAULT 'site_checker';
 CREATE TABLE IF NOT EXISTS user_projects (
   user_id TEXT NOT NULL,
   project_id TEXT NOT NULL,

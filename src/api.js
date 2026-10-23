@@ -150,7 +150,9 @@ async function computeSla(e) {
     // The previous completed step's timestamp is therefore
     // the timestamp at which the current step was received.
     const anchors = {
-      Checked: ap.project_check && ap.project_check.at,
+      Checked: ap.project_check?.skipped
+        ? (ap.resumed && ap.resumed.at) || e.submitted_at || e.created_at
+        : ap.project_check && ap.project_check.at,
       'GM Reviewed': ap.check && ap.check.at,
       'Project Director Reviewed': ap.purchase && ap.purchase.at,
       'Senior Accountant Reviewed': ap.operations && ap.operations.at,
@@ -298,6 +300,18 @@ async function buildPaymentZip(res, expenses) {
   await archive.finalize();
 }
 
+function workflowForExpense(e, configuredFirstReviewer) {
+  let approvals = {};
+  try { approvals = JSON.parse(e.approvals || '{}'); } catch {}
+  if (approvals.project_check?.skipped) return 'general_manager';
+  if (approvals.check?.skipped) return 'site_checker';
+  // Existing vouchers predate the per-project choice and retain the original
+  // Site Checker -> General Manager path until they are resubmitted.
+  return e.status === 'Draft'
+    ? (configuredFirstReviewer === 'general_manager' ? 'general_manager' : 'site_checker')
+    : 'legacy';
+}
+
 async function decorate(e, m) {
   const p = m.proj[e.project_id];
   const [evCount, sla, previousDelays, amountBreakdown] = await Promise.all([
@@ -313,6 +327,7 @@ async function decorate(e, m) {
     approvals: JSON.parse(e.approvals || '{}'),
     categoryName: m.cat[e.category_id] || '—',
     projectCode: p ? p.code : '—',
+    firstReviewer: workflowForExpense(e, p?.first_reviewer),
     projectName: p ? `${p.code} · ${p.name}` : '—',
     locationName: m.loc[e.location_id] || '—',
     createdByName: m.usr[e.created_by] || '—',
@@ -550,11 +565,18 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
 
   const id = uid();
   const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId || null);
-  const checkerEntry = projectChecker;
-  const status = asDraft ? 'Draft' : (checkerEntry ? 'Checked' : 'Submitted');
-  const approvals = (!asDraft && checkerEntry) ? JSON.stringify({
-    project_check: { by: req.user.id, at: now() },
-  }) : '{}';
+  const project = await db.prepare('SELECT first_reviewer FROM projects WHERE id=?').get(b.projectId);
+  const firstReviewer = project?.first_reviewer === 'general_manager' ? 'general_manager' : 'site_checker';
+  const checkerEntry = firstReviewer === 'site_checker' && projectChecker;
+  const status = asDraft ? 'Draft' : (firstReviewer === 'general_manager' || checkerEntry ? 'Checked' : 'Submitted');
+  const approvalsData = {};
+  if (!asDraft && firstReviewer === 'general_manager') {
+    approvalsData.project_check = { skipped: true, reason: 'Not required for this project workflow' };
+  } else if (!asDraft) {
+    approvalsData.check = { skipped: true, reason: 'Not required for this project workflow' };
+    if (checkerEntry) approvalsData.project_check = { by: req.user.id, at: now() };
+  }
+  const approvals = JSON.stringify(approvalsData);
   // voucher + evidence + history + audit succeed or roll back together
   let voucher;
 
@@ -584,8 +606,10 @@ router.post('/expenses', requireVoucherCreator, upload.array('photos', 12), asyn
     }
 
     await addHistory(id, req.user.id, asDraft ? 'Created draft' : 'Submitted', 'Voucher created');
-    if (!asDraft && checkerEntry) await addHistory(id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
+    if (!asDraft && firstReviewer === 'general_manager') await addHistory(id, req.user.id, 'Site Checker skipped', 'General Manager is the first reviewer for this project');
+    if (!asDraft && checkerEntry) await addHistory(id, req.user.id, 'Checked by Site Checker', 'Site Accounts user is also the assigned Site Checker');
     await logAudit(req.user, asDraft ? 'Created draft' : 'Submitted expense', 'expense', voucher, '₹' + toRupees(amountPaise));
+    if (!asDraft && firstReviewer === 'general_manager') await logAudit(req.user, 'Site Checker skipped', 'expense', voucher, 'General Manager is the first reviewer for this project');
     if (!asDraft && checkerEntry) await logAudit(req.user, 'Checked by Site Checker', 'expense', voucher, 'Automatically checked on submission');
   });
     res.json({ id, voucherNo: voucher });
@@ -633,9 +657,18 @@ router.patch('/expenses/:id', async (req, res) => {
   }
   const locationId = b.location != null ? await resolveLocationId(b.location) : (b.locationId ?? e.location_id);
   const isQueryEdit = e.status === 'Query';
-  const checkerSubmission = willSubmit && isCheckerEditable;
-  const nextStatus = isQueryEdit ? 'Query' : (b.asDraft ? 'Draft' : (checkerSubmission ? 'Checked' : 'Submitted'));
-  const approvals = isQueryEdit ? e.approvals : (checkerSubmission ? JSON.stringify({ project_check: { by: req.user.id, at: now() } }) : '{}');
+  const project = await db.prepare('SELECT first_reviewer FROM projects WHERE id=?').get(e.project_id);
+  const firstReviewer = project?.first_reviewer === 'general_manager' ? 'general_manager' : 'site_checker';
+  const checkerSubmission = willSubmit && firstReviewer === 'site_checker' && isCheckerEditable;
+  const nextStatus = isQueryEdit ? 'Query' : (b.asDraft ? 'Draft' : (firstReviewer === 'general_manager' || checkerSubmission ? 'Checked' : 'Submitted'));
+  const resetApprovals = {};
+  if (willSubmit && firstReviewer === 'general_manager') {
+    resetApprovals.project_check = { skipped: true, reason: 'Not required for this project workflow' };
+  } else if (willSubmit) {
+    resetApprovals.check = { skipped: true, reason: 'Not required for this project workflow' };
+    if (checkerSubmission) resetApprovals.project_check = { by: req.user.id, at: now() };
+  }
+  const approvals = isQueryEdit ? e.approvals : JSON.stringify(resetApprovals);
   await db.prepare(`UPDATE expenses SET date=?,amount=?,category_id=?,details=?,location_id=?,
     expense_done_by=?,bill_received=?,bill_no=?,remark=?,status=?,approvals=?,submitted_at=?,updated_at=? WHERE id=?`).run(
     b.date ?? e.date, amountPaise, b.categoryId ?? e.category_id,
@@ -652,17 +685,19 @@ router.patch('/expenses/:id', async (req, res) => {
     await db.prepare('DELETE FROM expense_amount_breakdowns WHERE expense_id=?').run(e.id);
   }
   await addHistory(e.id, req.user.id, checkerSubmission && !isQueryEdit ? 'Submitted' : 'Edited', isQueryEdit ? 'Edited during query — approval will restart when the query is resolved' : checkerSubmission ? 'Updated and submitted voucher' : 'Updated voucher');
-  if (checkerSubmission && !isQueryEdit) await addHistory(e.id, req.user.id, 'Checked by Site Checker', 'Checker-created voucher starts checked');
+  if (willSubmit && firstReviewer === 'general_manager' && !isQueryEdit) await addHistory(e.id, req.user.id, 'Site Checker skipped', 'General Manager is the first reviewer for this project');
+  if (checkerSubmission && !isQueryEdit) await addHistory(e.id, req.user.id, 'Checked by Site Checker', 'Site Accounts user is also the assigned Site Checker');
   await logAudit(req.user, 'Edited expense', 'expense', e.voucher_no, '');
+  if (willSubmit && firstReviewer === 'general_manager' && !isQueryEdit) await logAudit(req.user, 'Site Checker skipped', 'expense', e.voucher_no, 'General Manager is the first reviewer for this project');
   if (checkerSubmission && !isQueryEdit) await logAudit(req.user, 'Checked by Site Checker', 'expense', e.voucher_no, 'Automatically checked on submission');
   res.json({ ok: true });
 });
 
 // ---- sequential review ladder (server-enforced order) ----
 const FLOW = {
-  project_check: { from: 'Submitted',        to: 'Checked',             projectChecker: true,       key: 'project_check', label: 'Checked by Site Checker' },
-  check:      { from: 'Checked',              to: 'GM Reviewed',          role: 'general_manager',    key: 'check',      label: 'Reviewed by General Manager' },
-  purchase:   { from: 'GM Reviewed',          to: 'Project Director Reviewed', role: 'project_director', key: 'purchase', label: 'Reviewed by Project Director / Incharge' },
+  project_check: { from: 'Submitted',        to: 'Checked',             projectChecker: true,       workflow: 'site_checker', key: 'project_check', label: 'Checked by Site Checker' },
+  check:      { from: 'Checked',              to: 'GM Reviewed',          role: 'general_manager', workflow: 'general_manager', key: 'check',      label: 'Reviewed by General Manager' },
+  purchase:   { from: null,                   to: 'Project Director Reviewed', role: 'project_director', key: 'purchase', label: 'Reviewed by Project Director / Incharge' },
   operations: { from: 'Project Director Reviewed', to: 'Senior Accountant Reviewed', role: 'senior_accountant', key: 'operations', label: 'Reviewed by Senior Accountant' },
   accounts:   { from: 'Senior Accountant Reviewed', to: 'Account Manager Reviewed', roles: ['accounts_manager', 'account_checker'], key: 'accounts', label: 'Reviewed by Accounts Manager / Head' },
   approve:    { from: 'Account Manager Reviewed', to: 'Approved', role: 'accounts_manager', key: 'approved', label: 'Approved' },
@@ -672,6 +707,15 @@ router.post('/expenses/:id/advance/:step', async (req, res) => {
   if (!step) return res.status(400).json({ error: 'Unknown step' });
   const e = await db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
+  const project = await db.prepare('SELECT first_reviewer FROM projects WHERE id=?').get(e.project_id);
+  const firstReviewer = workflowForExpense(e, project?.first_reviewer);
+  if (step.workflow === 'site_checker' && !['site_checker', 'legacy'].includes(firstReviewer))
+    return res.status(409).json({ error: 'This review step is not part of the selected project workflow' });
+  if (step.workflow === 'general_manager' && firstReviewer === 'site_checker')
+    return res.status(409).json({ error: 'This review step is not part of the selected project workflow' });
+  const expectedFrom = req.params.step === 'purchase'
+    ? (firstReviewer === 'site_checker' ? 'Checked' : 'GM Reviewed')
+    : step.from;
   const stepAllowed = step.projectChecker
     ? hasProjectChecker(req.user, e.project_id)
     : step.roles
@@ -680,8 +724,8 @@ router.post('/expenses/:id/advance/:step', async (req, res) => {
   if (!stepAllowed && req.user.role !== 'admin')
     return res.status(403).json({ error: step.projectChecker ? 'Only an assigned Site Checker can do this step' : `Only ${step.roles ? step.roles.join(' or ') : step.role} can do this step` });
   if (!inScope(req.user, e.project_id)) return res.status(403).json({ error: 'Project not in your access' });
-  if (e.status !== step.from)
-    return res.status(409).json({ error: `Voucher must be "${step.from}" first (it is "${e.status}")` });
+  if (e.status !== expectedFrom)
+    return res.status(409).json({ error: `Voucher must be "${expectedFrom}" first (it is "${e.status}")` });
   // Delay justification -- an overdue step cannot proceed without a reason for the delay
   const sla = await computeSla(e);
   const overdue = sla && Date.now() > sla.dueAt;
@@ -690,10 +734,11 @@ router.post('/expenses/:id/advance/:step', async (req, res) => {
   const approvals = JSON.parse(e.approvals || '{}');
   delete approvals.resumed;
   approvals[step.key] = { by: req.user.id, at: now() };
+  if (req.params.step === 'project_check' && firstReviewer === 'site_checker') approvals.check = { skipped: true, reason: 'Not required for this project workflow' };
   // Atomic: re-check status in the same statement that changes it, so two
   // simultaneous requests can't both succeed against the same "from" state.
   const result = await db.prepare('UPDATE expenses SET status=?,approvals=?,updated_at=? WHERE id=? AND status=?')
-    .run(step.to, JSON.stringify(approvals), now(), e.id, step.from);
+    .run(step.to, JSON.stringify(approvals), now(), e.id, expectedFrom);
   if (result.changes === 0) {
     return res.status(409).json({ error: 'This voucher was just updated by someone else — please refresh and try again.' });
   }
@@ -782,12 +827,14 @@ router.post('/queries/:id/resolve', async (req, res) => {
     .run(uid(), q.id, req.user.id, overdue ? ('Marked resolved. Delay reason: ' + reason) : 'Marked resolved.', now());
   const stillOpen = await db.prepare("SELECT 1 FROM queries WHERE expense_id=? AND status='Open' LIMIT 1").get(q.expense_id);
   if (!stillOpen && e && e.status === 'Query') {
+    const project = await db.prepare('SELECT first_reviewer FROM projects WHERE id=?').get(e.project_id);
+    const firstReviewer = workflowForExpense(e, project?.first_reviewer);
     const dataEdited = !!(await db.prepare(
       "SELECT 1 FROM expense_history WHERE expense_id=? AND action='Edited' AND at>=? LIMIT 1"
     ).get(e.id, q.created_at));
     const resumable = {
       Submitted: 'Site Checker',
-      Checked: 'General Manager',
+      Checked: firstReviewer === 'site_checker' ? 'Project Director / Incharge' : 'General Manager',
       'GM Reviewed': 'Project Director / Incharge',
       'Project Director Reviewed': 'Senior Accountant',
       'Senior Accountant Reviewed': 'Accounts Manager / Head',
@@ -803,17 +850,24 @@ router.post('/queries/:id/resolve', async (req, res) => {
     } else {
       const creator = await loadUser(e.created_by);
       const approvals = JSON.parse(e.approvals || '{}');
-      const checkerVoucher = creator && creator.role === 'site_checker' && approvals.project_check;
-      const resetStatus = checkerVoucher ? 'Checked' : 'Submitted';
+      const resetWorkflow = project?.first_reviewer === 'general_manager' ? 'general_manager' : 'site_checker';
+      const checkerVoucher = resetWorkflow === 'site_checker' && creator && hasProjectChecker(creator, e.project_id) && approvals.project_check && !approvals.project_check.skipped;
+      const resetStatus = resetWorkflow === 'general_manager' || checkerVoucher ? 'Checked' : 'Submitted';
       const resetAt = now();
-      const resetApprovals = checkerVoucher
-        ? JSON.stringify({ project_check: approvals.project_check, resumed: { by: req.user.id, at: resetAt } })
-        : '{}';
+      const resetApprovals = {};
+      if (resetWorkflow === 'general_manager') resetApprovals.project_check = { skipped: true, reason: 'Not required for this project workflow' };
+      else {
+        resetApprovals.check = { skipped: true, reason: 'Not required for this project workflow' };
+        if (checkerVoucher) resetApprovals.project_check = approvals.project_check;
+      }
+      resetApprovals.resumed = { by: req.user.id, at: resetAt };
       await db.prepare("UPDATE expenses SET status=?,approvals=?,prev_status=NULL,submitted_at=?,updated_at=? WHERE id=?")
-        .run(resetStatus, resetApprovals, resetAt, resetAt, e.id);
+        .run(resetStatus, JSON.stringify(resetApprovals), resetAt, resetAt, e.id);
       await addHistory(e.id, req.user.id, 'Query resolved', checkerVoucher
-        ? 'Voucher edited during query — re-approval from General Manager onward'
-        : 'Voucher edited during query — full re-approval required from Site Checker onward');
+        ? 'Voucher edited during query — re-approval from Project Director onward'
+        : resetWorkflow === 'general_manager'
+          ? 'Voucher edited during query — General Manager review is required again'
+          : 'Voucher edited during query — Site Checker review is required again');
     }
   }
   await logAudit(req.user, 'Resolved query', 'expense', q.voucher_no, '');
@@ -1083,6 +1137,17 @@ router.post('/masters/:type/:id/rename', requireRole('admin'), async (req, res) 
   }
   await logAudit(req.user, 'Renamed master', 'master', t, `${row.name} → ${name}`);
   res.json({ ok: true });
+});
+router.post('/masters/projects/:id/workflow', requireRole('admin'), async (req, res) => {
+  const firstReviewer = String(req.body.firstReviewer || '');
+  if (!['site_checker', 'general_manager'].includes(firstReviewer)) {
+    return res.status(400).json({ error: 'Choose Site Checker or General Manager as the first reviewer' });
+  }
+  const project = await db.prepare('SELECT id FROM projects WHERE id=?').get(req.params.id);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  await db.prepare('UPDATE projects SET first_reviewer=? WHERE id=?').run(firstReviewer, project.id);
+  await logAudit(req.user, 'Changed project workflow', 'project', project.id, `First reviewer: ${firstReviewer}`);
+  res.json({ ok: true, firstReviewer });
 });
 
 // ================================================================ REPORTS (CSV)
@@ -1629,6 +1694,8 @@ router.get(
         projectName:
           m.proj[e.project_id]?.name || '',
 
+        firstReviewer: workflowForExpense(e, m.proj[e.project_id]?.first_reviewer),
+
         locationName:
           m.loc[e.location_id] || '',
 
@@ -1645,6 +1712,11 @@ router.get(
           m.usr[e.created_by] || '',
 
         approvalNames: {
+          site_checker:
+            approvals.project_check?.by
+              ? m.usr[approvals.project_check.by] || ''
+              : '',
+
           general_manager:
             approvals.check?.by
               ? m.usr[approvals.check.by] || ''

@@ -286,19 +286,21 @@ function pendingForMe(list) {
   const r = S.user.role;
   const atStage = (e, statuses) =>
     e.status === 'Query' ? statuses.includes(e.prev_status) : statuses.includes(e.status);
+  const firstReviewer = (e) => e.firstReviewer || 'site_checker';
   const projectCheckPending = (e) =>
-    atStage(e, ["Submitted"]) &&
+    ['site_checker', 'legacy'].includes(firstReviewer(e)) && atStage(e, ["Submitted"]) &&
     (S.user.projectCheckerIds || []).includes(e.project_id);
   const projectCheckerItems = list.filter(projectCheckPending);
   if (r === "general_manager")
     return [
-      ...projectCheckerItems,
-      ...list.filter((e) => atStage(e, ["Checked"])),
+      ...list.filter((e) => ['general_manager', 'legacy'].includes(firstReviewer(e)) && atStage(e, ["Checked"])),
     ];
   if (r === "project_director")
     return [
       ...projectCheckerItems,
-      ...list.filter((e) => atStage(e, ["GM Reviewed"])),
+      ...list.filter((e) => firstReviewer(e) === 'site_checker'
+        ? atStage(e, ["Checked"])
+        : atStage(e, ["GM Reviewed"])),
     ];
   if (r === "senior_accountant")
     return [
@@ -1952,7 +1954,6 @@ Views._printFundRequest = async function (id) {
     const accountsReviewers = new Set();
     const purchaseReviewers = new Set();
     const operationsReviewers = new Set();
-    const GeneralManagers = new Set();
 
     items.forEach((e) => {
       const names = e.approvalNames || {};
@@ -1969,9 +1970,6 @@ Views._printFundRequest = async function (id) {
         operationsReviewers.add(names.operations);
       }
 
-      if (names.general_manager) {
-        GeneralManagers.add(names.general_manager);
-      }
     });
 
     const accountsReviewerName =
@@ -1983,7 +1981,6 @@ Views._printFundRequest = async function (id) {
     const operationsReviewerName =
       Array.from(operationsReviewers).join(", ") || "—";
 
-    const GeneralManagerName = Array.from(GeneralManagers).join(", ") || "—";
 
     /*
      * The Admin is the person who created the fund request.
@@ -2017,6 +2014,28 @@ Views._printFundRequest = async function (id) {
     const projects = Array.from(projectMap.values()).sort((a, b) =>
       a.code.localeCompare(b.code),
     );
+
+    const firstReviewerSignatures = projects.flatMap((project) => {
+      const signers = new Map();
+      project.items.forEach((item) => {
+        const names = item.approvalNames || {};
+        const roles = item.firstReviewer === "site_checker"
+          ? [["site_checker", "Site Checker", names.site_checker]]
+          : item.firstReviewer === "general_manager"
+            ? [["general_manager", "General Manager", names.general_manager]]
+            : [["site_checker", "Site Checker", names.site_checker], ["general_manager", "General Manager", names.general_manager]];
+        roles.forEach(([key, role, name]) => {
+          if (name) signers.set(`${key}:${name}`, { role, name });
+        });
+      });
+      return Array.from(signers.values()).map((signer) => ({ ...signer, projectCode: project.code }));
+    }).map((signer) => `
+      <div class="digital-signature-box">
+        <div class="digital-signature-status">DIGITALLY VERIFIED</div>
+        <div class="digital-signature-name">${esc(signer.name)}</div>
+        <div class="digital-signature-role">${esc(signer.role)} · ${esc(signer.projectCode)}</div>
+      </div>
+    `).join("");
 
     const total = items.reduce((sum, e) => sum + Number(e.amount || 0), 0);
 
@@ -3073,20 +3092,7 @@ Views._printFundRequest = async function (id) {
 
             <div class="digital-signatures">
 
-            <!-- GM -->
-              <div class="digital-signature-box">
-                <div class="digital-signature-status">
-                  DIGITALLY VERIFIED
-                </div>
-
-                <div class="digital-signature-name">
-                  ${esc(GeneralManagerName || "—")}
-                </div>
-
-                <div class="digital-signature-role">
-                  General Manager 
-                </div>
-              </div>
+              ${firstReviewerSignatures}
 
               <!-- PURCHASE -->
               <div class="digital-signature-box">
@@ -3515,11 +3521,11 @@ Views.review = async function () {
   Views._reviewRows = rows;
   const hint =
     {
-      site_accounts: "Submitted items awaiting Site Checker review.",
+      site_accounts: "Items awaiting the first review step configured for each project.",
       site_checker: "Submitted items awaiting your Site Checker review.",
-      general_manager: "Checked items awaiting your review.",
+      general_manager: "Items at the General Manager step for projects using that workflow.",
       project_director:
-        "GM-reviewed items awaiting Project Director / Incharge review.",
+        "Items awaiting Project Director / Incharge review.",
       senior_accountant:
         "Project Director-reviewed items awaiting Senior Accountant review.",
       accounts_manager:
@@ -3708,7 +3714,7 @@ Views._master = async function (which) {
   const tabs = ["categories", "projects", "locations"];
   const head =
     which === "projects"
-      ? "<th>Code</th><th>Name</th><th>Status</th><th></th>"
+      ? "<th>Code</th><th>Name</th><th>First Reviewer</th><th>Status</th><th></th>"
       : "<th>Name</th><th>Status</th><th></th>";
   const statusPill = (x) =>
     x.active
@@ -3721,11 +3727,11 @@ Views._master = async function (which) {
   const rows = list
     .map((x) =>
       which === "projects"
-        ? `<tr><td class="mono">${esc(x.code)}</td><td>${esc(x.name)}</td><td>${statusPill(x)}</td><td style="text-align:right">${renameBtn(x)} ${toggleBtn(x)}</td></tr>`
+        ? `<tr><td class="mono">${esc(x.code)}</td><td>${esc(x.name)}</td><td>${x.first_reviewer === "general_manager" ? "General Manager" : "Site Checker"}</td><td>${statusPill(x)}</td><td style="text-align:right"><button class="btn btn-ghost btn-sm" onclick="Masters.workflow('${x.id}')">Workflow</button> ${renameBtn(x)} ${toggleBtn(x)}</td></tr>`
         : `<tr><td>${esc(x.name)}</td><td>${statusPill(x)}</td><td style="text-align:right">${renameBtn(x)} ${toggleBtn(x)}</td></tr>`,
     )
     .join("");
-  const colspan = which === "projects" ? 4 : 3;
+  const colspan = which === "projects" ? 5 : 3;
   $("#content").innerHTML =
     `<div class="toolbar">${tabs.map((t) => `<button class="btn ${t === which ? "btn-primary" : "btn-ghost"} btn-sm" onclick="Views._master('${t}')">${t}</button>`).join("")}</div>
     <div class="card"><div class="card-pad" style="display:flex;align-items:center;border-bottom:1px solid var(--line)"><h3 style="text-transform:capitalize">${which}</h3><button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="Masters.add('${which}')">+ Add</button></div><div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${rows || `<tr><td colspan="${colspan}"><div class="empty">None yet</div></td></tr>`}</tbody></table></div></div>`;
@@ -4220,17 +4226,33 @@ const Detail = {
   },
   ladder(e) {
     const ap = e.approvals || {};
-    const steps = [
-      ["project_check", "Level 1 — Site Checker"],
-      ["check", "Level 2 — General Manager Review"],
-      ["purchase", "Level 3 — Project Director Reviewed"],
-      ["operations", "Level 4 — Senior Accountant Reviewed"],
-      ["accounts", "Level 5 — Account Manager Reviewed"],
-      ["approved", "Final — Approved"],
-    ];
+    const reviewerWorkflow = e.firstReviewer || 'legacy';
+    const checkerWorkflow = reviewerWorkflow === 'site_checker';
+    const steps = checkerWorkflow
+      ? [
+          ["project_check", "Level 1 — Site Checker"],
+          ["purchase", "Level 2 — Project Director Reviewed"],
+          ["operations", "Level 3 — Senior Accountant Reviewed"],
+          ["accounts", "Level 4 — Account Manager Reviewed"],
+          ["approved", "Final — Approved"],
+        ]
+      : reviewerWorkflow === 'general_manager' ? [
+          ["check", "Level 1 — General Manager Review"],
+          ["purchase", "Level 2 — Project Director Reviewed"],
+          ["operations", "Level 3 — Senior Accountant Reviewed"],
+          ["accounts", "Level 4 — Account Manager Reviewed"],
+          ["approved", "Final — Approved"],
+        ] : [
+          ["project_check", "Level 1 — Site Checker"],
+          ["check", "Level 2 — General Manager Review"],
+          ["purchase", "Level 3 — Project Director Reviewed"],
+          ["operations", "Level 4 — Senior Accountant Reviewed"],
+          ["accounts", "Level 5 — Account Manager Reviewed"],
+          ["approved", "Final — Approved"],
+        ];
     const nowMap = {
       Submitted: "project_check",
-      Checked: "check",
+      Checked: checkerWorkflow ? "purchase" : "check",
       "GM Reviewed": "purchase",
       "Project Director Reviewed": "operations",
       "Senior Accountant Reviewed": "accounts",
@@ -4241,7 +4263,7 @@ const Detail = {
       .map(([k, label], i) => {
         const a = ap[k];
         let cls = "wait",
-          mark = i < 5 ? i + 1 : "✓",
+          mark = k === "approved" ? "✓" : i + 1,
           meta = "Awaiting";
         if (a) {
           cls = "done";
@@ -4261,6 +4283,8 @@ const Detail = {
     const r = S.user.role,
       a = [],
       s = e.status,
+      reviewerWorkflow = e.firstReviewer || 'legacy',
+      checkerWorkflow = reviewerWorkflow === 'site_checker',
       admin = r === "admin",
       projectChecker = (S.user.projectCheckerIds || []).includes(e.project_id),
       canReviewThisStage =
@@ -4273,15 +4297,15 @@ const Detail = {
           "admin",
         ].includes(r) ||
         (s === "Submitted" && projectChecker);
-    if (s === "Submitted" && (projectChecker || admin))
+    if (s === "Submitted" && (projectChecker || admin) && reviewerWorkflow !== 'general_manager')
       a.push(
         `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','project_check')">✓ Mark Checked</button>`,
       );
-    if (s === "Checked" && (r === "general_manager" || admin))
+    if (s === "Checked" && !checkerWorkflow && (r === "general_manager" || admin))
       a.push(
         `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','check')">✓ Review (General Manager)</button>`,
       );
-    if (s === "GM Reviewed" && (r === "project_director" || admin))
+    if (((s === "Checked" && checkerWorkflow) || (s === "GM Reviewed" && !checkerWorkflow)) && (r === "project_director" || admin))
       a.push(
         `<button class="btn btn-primary btn-sm" onclick="Detail.advance('${e.id}','purchase')">✓ Review (Project Director / Incharge)</button>`,
       );
@@ -4664,6 +4688,22 @@ const UsersAdmin = {
   },
 };
 const Masters = {
+  workflow(id) {
+    const project = (Views._mastersData.projects || []).find((p) => p.id === id);
+    if (!project) return;
+    Modal.open(`<div class="modal-head"><h3>Project Review Workflow</h3><button class="x" onclick="Modal.close()">×</button></div><div class="modal-body"><div class="csub">${esc(project.code)} · ${esc(project.name)}</div><div class="field full"><label>First reviewer *</label><select id="m-first-reviewer"><option value="site_checker" ${project.first_reviewer !== "general_manager" ? "selected" : ""}>Site Checker, then Project Director</option><option value="general_manager" ${project.first_reviewer === "general_manager" ? "selected" : ""}>General Manager, then Project Director</option></select></div><div class="csub">Both workflows continue through Senior Accountant, Accounts Manager, and final approval.</div></div><div class="modal-foot"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="Masters.saveWorkflow('${id}')">Save</button></div>`);
+  },
+  async saveWorkflow(id) {
+    try {
+      await api("POST", `/masters/projects/${id}/workflow`, { firstReviewer: $("#m-first-reviewer").value });
+      Modal.close();
+      toast("Project workflow saved", "ok");
+      await refreshLookups();
+      Views._master("projects");
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  },
   add(type) {
     const isProj = type === "projects";
     Modal.open(
