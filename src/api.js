@@ -94,13 +94,17 @@ async function nameMaps() {
     db.prepare('SELECT id,name FROM categories').all(),
     db.prepare('SELECT id,code,name FROM projects').all(),
     db.prepare('SELECT id,name FROM locations').all(),
-    db.prepare('SELECT id,name FROM users').all(),
+    db.prepare('SELECT id,name,username,role FROM users').all(),
   ]);
   return {
     cat: Object.fromEntries(cats.map(r => [r.id, r.name])),
     proj: Object.fromEntries(projs.map(r => [r.id, r])),
     loc: Object.fromEntries(locs.map(r => [r.id, r.name])),
     usr: Object.fromEntries(users.map(r => [r.id, r.name])),
+    userRole: Object.fromEntries(users.map(r => [r.id, r.role])),
+    systemAdmin: Object.fromEntries(users.map(r => [r.id,
+      r.role === 'admin' && (String(r.username || '').toLowerCase() === 'admin' || String(r.name || '').toLowerCase() === 'system admin')
+    ])),
   };
 }
 const DAY_MS = 86400000;
@@ -1709,32 +1713,32 @@ router.get(
           m.cat[e.category_id] || '',
 
         createdByName:
-          m.usr[e.created_by] || '',
+          m.systemAdmin[e.created_by] ? '' : m.usr[e.created_by] || '',
 
         approvalNames: {
           site_checker:
             approvals.project_check?.by
-              ? m.usr[approvals.project_check.by] || ''
+              ? (m.systemAdmin[approvals.project_check.by] ? '' : m.usr[approvals.project_check.by] || '')
               : '',
 
           general_manager:
             approvals.check?.by
-              ? m.usr[approvals.check.by] || ''
+              ? (m.systemAdmin[approvals.check.by] ? '' : m.usr[approvals.check.by] || '')
               : '',
 
           accounts:
             approvals.accounts?.by
-              ? m.usr[approvals.accounts.by] || ''
+              ? (m.systemAdmin[approvals.accounts.by] ? '' : m.usr[approvals.accounts.by] || '')
               : '',
 
           purchase:
             approvals.purchase?.by
-              ? m.usr[approvals.purchase.by] || ''
+              ? (m.systemAdmin[approvals.purchase.by] ? '' : m.usr[approvals.purchase.by] || '')
               : '',
 
           operations:
             approvals.operations?.by
-              ? m.usr[approvals.operations.by] || ''
+              ? (m.systemAdmin[approvals.operations.by] ? '' : m.usr[approvals.operations.by] || '')
               : '',
         },
       };

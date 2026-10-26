@@ -2017,13 +2017,16 @@ Views._printFundRequest = async function (id) {
 
     const firstReviewerSignatures = projects.flatMap((project) => {
       const signers = new Map();
-      project.items.forEach((item) => {
+      const sortedItems = project.items.slice().sort((a, b) =>
+        String(a.voucher_no || "").localeCompare(String(b.voucher_no || ""), undefined, { numeric: true }),
+      );
+      sortedItems.forEach((item) => {
         const names = item.approvalNames || {};
         const roles = item.firstReviewer === "site_checker"
           ? [["site_checker", "Site Checker", names.site_checker]]
           : [["general_manager", "General Manager", names.general_manager]];
         roles.forEach(([key, role, name]) => {
-          if (name) signers.set(`${key}:${name}`, { role, name });
+          if (name && !signers.has(key)) signers.set(key, { role, name });
         });
       });
       return Array.from(signers.values()).map((signer) => ({ ...signer, projectCode: project.code }));
