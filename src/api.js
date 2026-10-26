@@ -1694,7 +1694,7 @@ router.get(
         projectName:
           m.proj[e.project_id]?.name || '',
 
-        firstReviewer: workflowForExpense(e, m.proj[e.project_id]?.first_reviewer),
+        firstReviewer: m.proj[e.project_id]?.first_reviewer === 'general_manager' ? 'general_manager' : 'site_checker',
 
         locationName:
           m.loc[e.location_id] || '',

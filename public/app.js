@@ -2021,9 +2021,7 @@ Views._printFundRequest = async function (id) {
         const names = item.approvalNames || {};
         const roles = item.firstReviewer === "site_checker"
           ? [["site_checker", "Site Checker", names.site_checker]]
-          : item.firstReviewer === "general_manager"
-            ? [["general_manager", "General Manager", names.general_manager]]
-            : [["site_checker", "Site Checker", names.site_checker], ["general_manager", "General Manager", names.general_manager]];
+          : [["general_manager", "General Manager", names.general_manager]];
         roles.forEach(([key, role, name]) => {
           if (name) signers.set(`${key}:${name}`, { role, name });
         });
@@ -2034,6 +2032,17 @@ Views._printFundRequest = async function (id) {
         <div class="digital-signature-status">DIGITALLY VERIFIED</div>
         <div class="digital-signature-name">${esc(signer.name)}</div>
         <div class="digital-signature-role">${esc(signer.role)} · ${esc(signer.projectCode)}</div>
+      </div>
+    `).join("");
+
+    const sitePersonSignatures = projects.flatMap((project) => {
+      const names = new Set(project.items.map((item) => item.createdByName).filter(Boolean));
+      return Array.from(names).map((name) => ({ name, projectCode: project.code }));
+    }).map((signer) => `
+      <div class="digital-signature-box">
+        <div class="digital-signature-status">DIGITALLY VERIFIED</div>
+        <div class="digital-signature-name">${esc(signer.name)}</div>
+        <div class="digital-signature-role">Site Accounts · ${esc(signer.projectCode)}</div>
       </div>
     `).join("");
 
@@ -3091,6 +3100,8 @@ Views._printFundRequest = async function (id) {
             </div>
 
             <div class="digital-signatures">
+
+              ${sitePersonSignatures}
 
               ${firstReviewerSignatures}
 
