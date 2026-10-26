@@ -92,7 +92,7 @@ function inQueryWorkflow(user, expense) {
 async function nameMaps() {
   const [cats, projs, locs, users] = await Promise.all([
     db.prepare('SELECT id,name FROM categories').all(),
-    db.prepare('SELECT id,code,name FROM projects').all(),
+    db.prepare('SELECT id,code,name,first_reviewer FROM projects').all(),
     db.prepare('SELECT id,name FROM locations').all(),
     db.prepare('SELECT id,name,username,role FROM users').all(),
   ]);
