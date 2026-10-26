@@ -2049,6 +2049,17 @@ Views._printFundRequest = async function (id) {
       </div>
     `).join("");
 
+    const hirenSignatures = projects
+      .filter((project) => String(project.code || "").toUpperCase() !== "HYD")
+      .map((project) => `
+        <div class="digital-signature-box">
+          <div class="digital-signature-status">DIGITALLY VERIFIED</div>
+          <div class="digital-signature-name">Hiren O.D. Ji</div>
+          <div class="digital-signature-role">Project Director · ${esc(project.code)}</div>
+        </div>
+      `)
+      .join("");
+
     const total = items.reduce((sum, e) => sum + Number(e.amount || 0), 0);
 
     const projectNames = projects
@@ -3123,20 +3134,7 @@ Views._printFundRequest = async function (id) {
                 </div>
               </div>
 
-              <!-- PURCHASE -->
-              <div class="digital-signature-box">
-                <div class="digital-signature-status">
-                  DIGITALLY VERIFIED
-                </div>
-
-                <div class="digital-signature-name">
-                  Hiren O.D. Ji
-                </div>
-
-                <div class="digital-signature-role">
-                  Project Director
-                </div>
-              </div>
+              ${hirenSignatures}
 
               <!-- OPERATIONS -->
               <div class="digital-signature-box">
